@@ -1,0 +1,3 @@
+supabase
+websocket-client
+python-dotenv
