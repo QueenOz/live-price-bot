@@ -75,8 +75,17 @@ class TDWebSocket:
             "price": float(data["price"]),
             "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         }).execute()
+        
+def get_symbols_from_supabase():
+    result = supabase.table("game_assets")\
+        .select("standardized_symbol")\
+        .neq("price_pull_status", "final")\
+        .execute()
+    symbols = list(set([r["standardized_symbol"] for r in result.data if r["standardized_symbol"]]))
+    return symbols
 
 if __name__ == "__main__":
-    symbols = ["AAPL", "TSLA", "ETH/USD"]  # Replace with dynamic fetch from Supabase
+    symbols = get_symbols_from_supabase()
     bot = TDWebSocket(symbols)
     bot.start()
+
