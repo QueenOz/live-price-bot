@@ -77,15 +77,29 @@ class TDWebSocket:
         }).execute()
         
 def get_symbols_from_supabase():
-    result = supabase.table("game_assets")\
-        .select("standardized_symbol")\
-        .neq("price_pull_status", "final")\
-        .execute()
-    symbols = list(set([r["standardized_symbol"] for r in result.data if r["standardized_symbol"]]))
-    return symbols
-
-if __name__ == "__main__":
-    symbols = get_symbols_from_supabase()
-    bot = TDWebSocket(symbols)
-    bot.start()
-
+    """
+    Fetch distinct standardized_symbol values from game_assets,
+    but only for assets linked to games with status = 'upcoming' or 'active'
+    """
+    try:
+        result = supabase.table("game_assets")\
+            .select("standardized_symbol, game_id")\
+            .in_("game_id", supabase.table("games")
+                  .select("id")
+                  .in_("status", ["upcoming", "active"])
+                  .execute()
+                  .data and [g["id"] for g in supabase.table("games")
+                                                   .select("id")
+                                                   .in_("status", ["upcoming", "active"])
+                                                   .execute().data])\
+            .execute()
+        
+        symbols = list(set([
+            r["standardized_symbol"]
+            for r in result.data
+            if r.get("standardized_symbol")
+        ]))
+        return symbols
+    except Exception as e:
+        print("❌ Failed to fetch symbols from Supabase:", e)
+        return []
