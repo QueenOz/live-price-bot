@@ -20,7 +20,7 @@ class TDWebSocket:
     def __init__(self, symbols):
         self.symbols = symbols
         self.queue = queue.Queue(maxsize=10000)
-        self.url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
+        self.url = "wss://ws.twelvedata.com/v1/ws"
         self.logger = logging.getLogger("TDWebSocket")
         logging.basicConfig(level=logging.INFO)
 
