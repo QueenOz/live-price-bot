@@ -69,12 +69,17 @@ class TDWebSocket:
                 self.logger.error(f"Error processing data: {e}")
 
     def upsert_price(self, data):
+    try:
+        sym = data["symbol"]  # e.g., 'EUR/USD'
         supabase.table("live_prices").upsert({
-            "symbol": data["symbol"],
-            "standardized_symbol": data["symbol"],
+            "symbol": sym,  # raw incoming
+            "standardized_symbol": sym.replace("/", "_"),  # e.g., 'EUR/USD' → 'EUR_USD'
             "price": float(data["price"]),
             "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         }).execute()
+        self.logger.info(f"✅ Price updated: {sym}")
+    except Exception as e:
+        self.logger.error(f"❌ Failed upsert for {data}: {e}")
 
 
 def get_symbols_from_supabase():
