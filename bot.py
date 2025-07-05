@@ -75,25 +75,27 @@ class TDWebSocket:
             "price": float(data["price"]),
             "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         }).execute()
-        
+
+
 def get_symbols_from_supabase():
-    """
-    Fetch distinct standardized_symbol values from game_assets,
-    but only for assets linked to games with status = 'upcoming' or 'active'
-    """
     try:
-        result = supabase.table("game_assets")\
-            .select("standardized_symbol, game_id")\
-            .in_("game_id", supabase.table("games")
-                  .select("id")
-                  .in_("status", ["upcoming", "active"])
-                  .execute()
-                  .data and [g["id"] for g in supabase.table("games")
-                                                   .select("id")
-                                                   .in_("status", ["upcoming", "active"])
-                                                   .execute().data])\
+        # Step 1: get IDs of upcoming or active games
+        active_games = supabase.table("games")\
+            .select("id")\
+            .in_("status", ["upcoming", "active"])\
             .execute()
-        
+
+        game_ids = [g["id"] for g in active_games.data]
+
+        if not game_ids:
+            return []
+
+        # Step 2: get unique standardized symbols from related assets
+        result = supabase.table("game_assets")\
+            .select("standardized_symbol")\
+            .in_("game_id", game_ids)\
+            .execute()
+
         symbols = list(set([
             r["standardized_symbol"]
             for r in result.data
@@ -103,3 +105,12 @@ def get_symbols_from_supabase():
     except Exception as e:
         print("❌ Failed to fetch symbols from Supabase:", e)
         return []
+
+if __name__ == "__main__":
+    symbols = get_symbols_from_supabase()
+    print("📡 Subscribing to:", symbols)
+    if symbols:
+        bot = TDWebSocket(symbols)
+        bot.start()
+    else:
+        print("⚠️ No symbols found. Exiting.")
