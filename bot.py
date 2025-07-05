@@ -20,7 +20,7 @@ class TDWebSocket:
     def __init__(self, symbols):
         self.symbols = symbols
         self.queue = queue.Queue(maxsize=10000)
-        self.url = "wss://ws.twelvedata.com/v1/ws"
+        self.url = "wss://ws.twelvedata.com/v1/ws"  # ✅ FIXED URL
         self.logger = logging.getLogger("TDWebSocket")
         logging.basicConfig(level=logging.INFO)
 
@@ -28,18 +28,18 @@ class TDWebSocket:
         def on_message(_, message):
             data = json.loads(message)
             if "symbol" in data and "price" in data:
-                self.logger.info(f"Received: {data}")
+                self.logger.info(f"📈 Received: {data}")
                 self.queue.put(data)
 
         def on_open(_):
-            self.logger.info("WebSocket connection opened")
+            self.logger.info("✅ WebSocket connection opened")
             self.subscribe(self.symbols)
 
         def on_close(_, code, msg):
-            self.logger.warning(f"WebSocket closed: {code}, {msg}")
+            self.logger.warning(f"⚠️ WebSocket closed: {code}, {msg}")
 
         def on_error(_, err):
-            self.logger.error(f"WebSocket error: {err}")
+            self.logger.error(f"❌ WebSocket error: {err}")
 
         self.ws = websocket.WebSocketApp(
             self.url,
@@ -55,10 +55,12 @@ class TDWebSocket:
         payload = {
             "action": "subscribe",
             "params": {
-                "symbols": ",".join(symbols)
+                "apikey": TD_API_KEY,
+                "channels": [f"price:{s}" for s in symbols]
             }
         }
         self.ws.send(json.dumps(payload))
+        self.logger.info(f"🧠 Subscribing to: {payload['params']['channels']}")
 
     def process_events(self):
         while True:
@@ -70,57 +72,47 @@ class TDWebSocket:
 
     def upsert_price(self, data):
         try:
-            sym = data["symbol"]  # e.g., 'EUR/USD'
+            symbol = data["symbol"]  # e.g., 'EUR/USD'
             supabase.table("live_prices").upsert({
-                "symbol": sym,
-                "standardized_symbol": sym.replace("/", "_"),
+                "symbol": symbol,
+                "standardized_symbol": symbol.replace("/", "_"),
                 "price": float(data["price"]),
                 "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             }).execute()
-            self.logger.info(f"✅ Price updated: {sym}")
+            self.logger.info(f"✅ Upserted: {symbol} → {data['price']}")
         except Exception as e:
-            self.logger.error(f"❌ Failed upsert for {data}: {e}")
-
+            self.logger.error(f"❌ Upsert failed for {data}: {e}")
 
 def get_symbols_from_supabase():
-    """
-    Fetch distinct asset_name values from game_assets where the game is upcoming or active.
-    These are the valid symbols for TwelveData WebSocket subscription.
-    """
     try:
-        # Get active or upcoming game IDs
         game_ids = supabase.table("games")\
             .select("id")\
             .in_("status", ["upcoming", "active"])\
-            .execute()\
-            .data
+            .execute().data
         game_ids = [g["id"] for g in game_ids]
-
         if not game_ids:
-            print("❌ No active or upcoming games.")
+            print("🚫 No active or upcoming games.")
             return []
 
-        # Get asset_name values from game_assets for those games
         result = supabase.table("game_assets")\
             .select("asset_name")\
             .in_("game_id", game_ids)\
             .execute()
 
-        # Remove None and duplicates
         symbols = list(set([
             r["asset_name"]
             for r in result.data
             if r.get("asset_name")
         ]))
-
         return symbols
     except Exception as e:
-        print("❌ Failed to fetch asset names from Supabase:", e)
+        print("❌ Error fetching symbols from Supabase:", e)
         return []
 
 if __name__ == "__main__":
     symbols = get_symbols_from_supabase()
-    print("🧠 Subscribing to:", symbols)
     if symbols:
         bot = TDWebSocket(symbols)
         bot.start()
+    else:
+        print("⚠️ No symbols to subscribe to. Exiting.")
