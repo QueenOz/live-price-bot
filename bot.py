@@ -78,39 +78,37 @@ class TDWebSocket:
 
 
 def get_symbols_from_supabase():
+    """
+    Fetch distinct asset_name values from game_assets where the game is upcoming or active.
+    These are the valid symbols for TwelveData WebSocket subscription.
+    """
     try:
-        # Step 1: get IDs of upcoming or active games
-        active_games = supabase.table("games")\
+        # Get active or upcoming game IDs
+        game_ids = supabase.table("games")\
             .select("id")\
             .in_("status", ["upcoming", "active"])\
-            .execute()
-
-        game_ids = [g["id"] for g in active_games.data]
+            .execute()\
+            .data
+        game_ids = [g["id"] for g in game_ids]
 
         if not game_ids:
+            print("❌ No active or upcoming games.")
             return []
 
-        # Step 2: get unique standardized symbols from related assets
+        # Get asset_name values from game_assets for those games
         result = supabase.table("game_assets")\
-            .select("standardized_symbol")\
+            .select("asset_name")\
             .in_("game_id", game_ids)\
             .execute()
 
+        # Remove None and duplicates
         symbols = list(set([
-            r["standardized_symbol"]
+            r["asset_name"]
             for r in result.data
-            if r.get("standardized_symbol")
+            if r.get("asset_name")
         ]))
+
         return symbols
     except Exception as e:
-        print("❌ Failed to fetch symbols from Supabase:", e)
+        print("❌ Failed to fetch asset names from Supabase:", e)
         return []
-
-if __name__ == "__main__":
-    symbols = get_symbols_from_supabase()
-    print("📡 Subscribing to:", symbols)
-    if symbols:
-        bot = TDWebSocket(symbols)
-        bot.start()
-    else:
-        print("⚠️ No symbols found. Exiting.")
