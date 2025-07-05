@@ -1,3 +1,4 @@
+# bot.py
 import os
 import time
 import json
@@ -8,111 +9,113 @@ import websocket
 from supabase import create_client
 from dotenv import load_dotenv
 
-# Load .env
+# Load environment
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+logging.basicConfig(level=logging.INFO)
 
 class TDWebSocket:
-    def __init__(self, symbols):
-        self.symbols = symbols
-        self.queue = queue.Queue(maxsize=10000)
-        self.url = "wss://ws.twelvedata.com/v1/ws"  # ✅ FIXED URL
+    def __init__(self):
+        self.ws = None
+        self.queue = queue.Queue()
         self.logger = logging.getLogger("TDWebSocket")
-        logging.basicConfig(level=logging.INFO)
+        self.symbols = []
 
     def start(self):
+        while True:
+            self.symbols = get_symbols_from_supabase()
+            if not self.symbols:
+                self.logger.warning("🚫 No active/upcoming symbols. Waiting 2 seconds.")
+                time.sleep(2)
+                continue
+
+            self.logger.info(f"🧠 Subscribing to: {self.symbols}")
+            try:
+                self.connect_and_run()
+            except Exception as e:
+                self.logger.error(f"❌ Crash: {e}")
+            self.logger.warning("🔁 Reconnecting in 2 seconds...")
+            time.sleep(2)
+
+    def connect_and_run(self):
         def on_message(_, message):
-            data = json.loads(message)
-            if "symbol" in data and "price" in data:
-                self.logger.info(f"📈 Received: {data}")
-                self.queue.put(data)
+            try:
+                data = json.loads(message)
+                if "symbol" in data and "price" in data:
+                    self.logger.info(f"📥 {data}")
+                    self.queue.put(data)
+            except Exception as e:
+                self.logger.error(f"❌ Parse error: {e}")
 
-        def on_open(_):
-            self.logger.info("✅ WebSocket connection opened")
-            self.subscribe(self.symbols)
-
-        def on_close(_, code, msg):
-            self.logger.warning(f"⚠️ WebSocket closed: {code}, {msg}")
+        def on_open(ws):
+            self.logger.info("🟢 Connected to TwelveData")
+            payload = {
+                "action": "subscribe",
+                "params": {
+                    "symbols": ",".join(self.symbols)
+                }
+            }
+            ws.send(json.dumps(payload))
 
         def on_error(_, err):
             self.logger.error(f"❌ WebSocket error: {err}")
 
+        def on_close(_, code, msg):
+            self.logger.warning(f"⚠️ WebSocket closed: {code}, {msg}")
+
         self.ws = websocket.WebSocketApp(
-            self.url,
+            f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}",
             on_message=on_message,
             on_open=on_open,
-            on_close=on_close,
-            on_error=on_error
+            on_error=on_error,
+            on_close=on_close
         )
-        threading.Thread(target=self.ws.run_forever, daemon=True).start()
-        self.process_events()
 
-    def subscribe(self, symbols):
-        payload = {
-            "action": "subscribe",
-            "params": {
-                "apikey": TD_API_KEY,
-                "channels": [f"price:{s}" for s in symbols]
-            }
-        }
-        self.ws.send(json.dumps(payload))
-        self.logger.info(f"🧠 Subscribing to: {payload['params']['channels']}")
+        thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        thread.start()
 
-    def process_events(self):
-        while True:
+        # Wait for up to 2 seconds between events
+        while thread.is_alive():
             try:
-                data = self.queue.get()
+                data = self.queue.get(timeout=2)
                 self.upsert_price(data)
-            except Exception as e:
-                self.logger.error(f"Error processing data: {e}")
+            except queue.Empty:
+                self.logger.info("⏳ No price updates. Refreshing.")
+                self.ws.close()
+                break
 
     def upsert_price(self, data):
         try:
-            symbol = data["symbol"]  # e.g., 'EUR/USD'
+            raw_symbol = data["symbol"]
+            std_symbol = raw_symbol.replace("/", "_")
             supabase.table("live_prices").upsert({
-                "symbol": symbol,
-                "standardized_symbol": symbol.replace("/", "_"),
+                "symbol": raw_symbol,
+                "standardized_symbol": std_symbol,
                 "price": float(data["price"]),
                 "updated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             }).execute()
-            self.logger.info(f"✅ Upserted: {symbol} → {data['price']}")
+            self.logger.info(f"✅ Upserted: {raw_symbol} = {data['price']}")
         except Exception as e:
             self.logger.error(f"❌ Upsert failed for {data}: {e}")
 
+
 def get_symbols_from_supabase():
     try:
-        game_ids = supabase.table("games")\
-            .select("id")\
-            .in_("status", ["upcoming", "active"])\
-            .execute().data
-        game_ids = [g["id"] for g in game_ids]
+        games = supabase.table("games").select("id").in_("status", ["upcoming", "active"]).execute().data
+        game_ids = [g["id"] for g in games]
         if not game_ids:
-            print("🚫 No active or upcoming games.")
             return []
 
-        result = supabase.table("game_assets")\
-            .select("asset_name")\
-            .in_("game_id", game_ids)\
-            .execute()
-
-        symbols = list(set([
-            r["asset_name"]
-            for r in result.data
-            if r.get("asset_name")
-        ]))
-        return symbols
+        result = supabase.table("game_assets").select("asset_name").in_("game_id", game_ids).execute().data
+        return list({r["asset_name"] for r in result if r.get("asset_name")})
     except Exception as e:
-        print("❌ Error fetching symbols from Supabase:", e)
+        logging.error(f"❌ Symbol fetch error: {e}")
         return []
 
+
 if __name__ == "__main__":
-    symbols = get_symbols_from_supabase()
-    if symbols:
-        bot = TDWebSocket(symbols)
-        bot.start()
-    else:
-        print("⚠️ No symbols to subscribe to. Exiting.")
+    TDWebSocket().start()
