@@ -1,4 +1,3 @@
-# bot.py
 import os
 import time
 import json
@@ -16,24 +15,27 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# Supabase client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TDWebSocket")
-
-GAMES_URL = f"{SUPABASE_URL}/rest/v1/games"
-ASSETS_URL = f"{SUPABASE_URL}/rest/v1/game_assets"
+# Constants
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}"
 }
-WEBSOCKET_URL = "wss://ws.twelvedata.com/v1/ws"
 SYMBOL_LIMIT = 8
+GAMES_URL = f"{SUPABASE_URL}/rest/v1/games"
+ASSETS_URL = f"{SUPABASE_URL}/rest/v1/game_assets"
+WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TDWebSocket")
+
+# Fetch symbols from active/upcoming games
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
         try:
-            # Get active or upcoming game IDs
             games_resp = await client.get(GAMES_URL, headers=HEADERS, params={
                 "select": "id",
                 "status": "in.(upcoming,active)"
@@ -42,7 +44,6 @@ async def fetch_symbols():
             if not game_ids:
                 return []
 
-            # Get symbols from active game_assets
             assets_resp = await client.get(ASSETS_URL, headers=HEADERS, params={
                 "select": "symbol",
                 "game_id": f"in.({','.join(game_ids)})"
@@ -53,6 +54,7 @@ async def fetch_symbols():
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
 
+# Upsert price into live_prices table
 async def upsert_price(data):
     try:
         symbol = data["symbol"]
@@ -66,10 +68,11 @@ async def upsert_price(data):
             "updated_at": datetime.utcnow().isoformat()
         }).execute()
 
-        logger.info(f"✅ Price updated: {symbol} → {price}")
+        logger.info(f"✅ {symbol} → {price}")
     except Exception as e:
-        logger.error(f"❌ Failed to upsert: {e}")
+        logger.error(f"❌ Failed to upsert price: {e}")
 
+# Main WebSocket loop
 async def price_bot_loop():
     while True:
         try:
@@ -80,31 +83,54 @@ async def price_bot_loop():
                 continue
 
             logger.info(f"🧠 Subscribing to: {symbols}")
-            async with websockets.connect(f"{WEBSOCKET_URL}?apikey={TD_API_KEY}") as ws:
+            async with websockets.connect(WEBSOCKET_URL) as ws:
+                # Send subscription
                 await ws.send(json.dumps({
                     "action": "subscribe",
                     "params": {"symbols": ",".join(symbols)}
                 }))
-                logger.info("🟢 Connected to TwelveData")
+
+                # Heartbeat task
+                async def send_heartbeat():
+                    while True:
+                        await asyncio.sleep(10)
+                        try:
+                            await ws.send(json.dumps({"action": "heartbeat"}))
+                            logger.debug("💓 Heartbeat sent")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Heartbeat failed: {e}")
+                            break
+
+                heartbeat_task = asyncio.create_task(send_heartbeat())
 
                 while True:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=10)
-                        data = json.loads(message)
-                        if "symbol" in data and "price" in data:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=12)
+                        data = json.loads(msg)
+
+                        if data.get("event") == "price" and "symbol" in data:
                             await upsert_price(data)
                         else:
-                            logger.debug(f"Ignored: {data}")
+                            logger.debug(f"Ignored event: {data}")
                     except asyncio.TimeoutError:
-                        logger.info("⏳ No price updates. Refreshing.")
+                        logger.warning("⏱️ Timeout. Reconnecting...")
                         break
+                    except Exception as e:
+                        logger.error(f"❌ WebSocket recv error: {e}")
+                        break
+
+                heartbeat_task.cancel()
+
         except Exception as e:
-            logger.error(f"⚠️ WebSocket error: {e}")
-        logger.warning("⚠️ Reconnecting in 2 seconds...")
+            logger.error(f"⚠️ WebSocket connection error: {e}")
+
+        logger.info("🔁 Reconnecting in 2 seconds...")
         await asyncio.sleep(2)
 
+# Run the bot
 if __name__ == "__main__":
     asyncio.run(price_bot_loop())
+
 
 
 
