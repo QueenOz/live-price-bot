@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from supabase import create_client
 
-# Load env
+# Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -33,23 +33,27 @@ SYMBOL_LIMIT = 8
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
         try:
-            # Step 1: Get active/upcoming game IDs
+            # 1. Fetch all active or upcoming game IDs
             games_resp = await client.get(GAMES_URL, headers=HEADERS, params={
                 "select": "id",
                 "status": "in.(upcoming,active)"
             })
             game_ids = [g["id"] for g in games_resp.json()]
             if not game_ids:
+                logger.info("⏳ No active/upcoming games found.")
                 return []
 
-            # Step 2: Get symbols from game_assets
+            # 2. Fetch symbols from game_assets
             assets_resp = await client.get(ASSETS_URL, headers=HEADERS, params={
                 "select": "symbol",
                 "game_id": f"in.({','.join(game_ids)})"
             })
+            raw_symbols = [a.get("symbol") for a in assets_resp.json()]
+            symbols = list({s for s in raw_symbols if s})  # Remove nulls + dedupe
 
-            symbols = [a["symbol"] for a in assets_resp.json() if a.get("symbol")]
-            return list(set(symbols))[:SYMBOL_LIMIT]
+            if not symbols:
+                logger.info("⏳ No symbols found in active game assets.")
+            return symbols[:SYMBOL_LIMIT]
         except Exception as e:
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
@@ -76,7 +80,6 @@ async def price_bot_loop():
         try:
             symbols = await fetch_symbols()
             if not symbols:
-                logger.info("⏳ No active symbols. Retrying in 2 seconds.")
                 await asyncio.sleep(2)
                 continue
 
@@ -86,7 +89,7 @@ async def price_bot_loop():
                     "action": "subscribe",
                     "params": {"symbols": ",".join(symbols)}
                 }))
-                logger.info("🟢 Connected to TwelveData WebSocket")
+                logger.info("🟢 Connected to TwelveData")
 
                 while True:
                     try:
@@ -97,13 +100,13 @@ async def price_bot_loop():
                         else:
                             logger.debug(f"Ignored: {data}")
                     except asyncio.TimeoutError:
-                        logger.info("⏳ Timeout — refreshing symbols.")
+                        logger.info("⏳ No price updates. Refreshing...")
                         break
         except Exception as e:
             logger.error(f"⚠️ WebSocket error: {e}")
-        logger.warning("⚠️ Reconnecting in 2 seconds...")
         await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(price_bot_loop())
+
 
