@@ -11,36 +11,39 @@ from supabase import create_client
 # Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")  # ✅ consistent
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# Initialize Supabase client
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Init Supabase
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Constants
-HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}"
+# Supabase request headers
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
 }
+
+# Twelve Data WebSocket endpoint
+WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
+
+# Other config
 SYMBOL_LIMIT = 8
 GAMES_URL = f"{SUPABASE_URL}/rest/v1/games"
 ASSETS_URL = f"{SUPABASE_URL}/rest/v1/game_assets"
-WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 
-# Logging
+# Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TDWebSocket")
 
-# Normalize DB symbol to Twelve Data format
+# Normalize symbol for WebSocket
 def normalize_symbol(symbol: str) -> str:
     return symbol.replace("_", "/") if "_" in symbol else symbol
 
-# Fetch active symbols for real-time streaming
+# Fetch game symbols
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
         try:
-            # Get all upcoming or active games
-            games_resp = await client.get(GAMES_URL, headers=HEADERS, params={
+            games_resp = await client.get(GAMES_URL, headers=SUPABASE_HEADERS, params={
                 "select": "id",
                 "status": "in.(upcoming,active)"
             })
@@ -48,8 +51,7 @@ async def fetch_symbols():
             if not game_ids:
                 return []
 
-            # Get symbols used in those games
-            assets_resp = await client.get(ASSETS_URL, headers=HEADERS, params={
+            assets_resp = await client.get(ASSETS_URL, headers=SUPABASE_HEADERS, params={
                 "select": "symbol",
                 "game_id": f"in.({','.join(game_ids)})"
             })
@@ -63,7 +65,7 @@ async def fetch_symbols():
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
 
-# Save real-time price update to Supabase
+# Save to live_prices
 async def upsert_price(data):
     try:
         symbol = data["symbol"]
@@ -81,7 +83,7 @@ async def upsert_price(data):
     except Exception as e:
         logger.error(f"❌ Failed to upsert price: {e}")
 
-# Main loop with reconnect logic and heartbeat
+# Main loop
 async def price_bot_loop():
     reconnect_delay = 2
 
@@ -89,19 +91,19 @@ async def price_bot_loop():
         try:
             symbols = await fetch_symbols()
             if not symbols:
-                logger.info("⏳ No symbols to track. Retrying in 5 seconds.")
+                logger.info("⏳ No symbols found. Retrying in 5s.")
                 await asyncio.sleep(5)
                 continue
 
             logger.info(f"🧠 Subscribing to: {symbols}")
             async with websockets.connect(WEBSOCKET_URL) as ws:
-                # Subscribe to price updates
                 await ws.send(json.dumps({
                     "action": "subscribe",
                     "params": {"symbols": ",".join(symbols)}
                 }))
+                logger.info(f"📤 Sent subscribe: {','.join(symbols)}")
 
-                # Heartbeat every 10 seconds
+                # Heartbeat task
                 async def send_heartbeat():
                     while True:
                         try:
@@ -114,7 +116,6 @@ async def price_bot_loop():
 
                 heartbeat_task = asyncio.create_task(send_heartbeat())
 
-                # Listen for messages
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=12)
@@ -125,7 +126,7 @@ async def price_bot_loop():
                         else:
                             logger.debug(f"Ignored message: {data}")
                     except asyncio.TimeoutError:
-                        logger.warning("⏱️ No messages in 12s. Reconnecting.")
+                        logger.warning("⏱️ Timeout. Reconnecting.")
                         break
                     except Exception as e:
                         logger.error(f"❌ Receive error: {e}")
@@ -138,15 +139,8 @@ async def price_bot_loop():
 
         logger.info(f"🔁 Reconnecting in {reconnect_delay} seconds...")
         await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, 30)  # exponential backoff (max 30s)
+        reconnect_delay = min(reconnect_delay * 2, 30)
 
-# Start the bot
+# Run
 if __name__ == "__main__":
     asyncio.run(price_bot_loop())
-
-
-
-
-
-
-
