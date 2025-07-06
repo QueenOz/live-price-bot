@@ -17,32 +17,31 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 # Init Supabase
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Supabase request headers
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_SERVICE_ROLE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
 }
 
-# Twelve Data WebSocket endpoint
+# Constants
 WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
-
-# Other config
 SYMBOL_LIMIT = 8
 GAMES_URL = f"{SUPABASE_URL}/rest/v1/games"
 ASSETS_URL = f"{SUPABASE_URL}/rest/v1/game_assets"
 
-# Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("TDWebSocket")
 
-# Normalize symbol for WebSocket
-def normalize_symbol(symbol: str) -> str:
-    return symbol.replace("_", "/") if "_" in symbol else symbol
+# Normalize symbol for Twelve Data
+def normalize_symbol(symbol: str, market_type: str) -> str:
+    if market_type in ["forex", "crypto", "stock"]:
+        return symbol.replace("_", "/")
+    return symbol
 
-# Fetch game symbols
+# Fetch symbols from game_assets
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
         try:
+            # Get active/upcoming games
             games_resp = await client.get(GAMES_URL, headers=SUPABASE_HEADERS, params={
                 "select": "id",
                 "status": "in.(upcoming,active)"
@@ -51,28 +50,33 @@ async def fetch_symbols():
             if not game_ids:
                 return []
 
+            # Get relevant asset symbols and market types
             assets_resp = await client.get(ASSETS_URL, headers=SUPABASE_HEADERS, params={
-                "select": "symbol",
+                "select": "standardized_symbol,market_type,game_status",
                 "game_id": f"in.({','.join(game_ids)})"
             })
-            symbols = list({
-                normalize_symbol(a["symbol"])
-                for a in assets_resp.json()
-                if a.get("symbol")
-            })
-            return symbols[:SYMBOL_LIMIT]
+
+            symbols = set()
+            for asset in assets_resp.json():
+                raw = asset.get("standardized_symbol")
+                market = asset.get("market_type")
+                if raw and market:
+                    symbols.add(normalize_symbol(raw, market))
+
+            return list(symbols)[:SYMBOL_LIMIT]
+
         except Exception as e:
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
 
-# Save to live_prices
+# Upsert into live_prices table
 async def upsert_price(data):
     try:
         symbol = data["symbol"]
         price = float(data["price"])
         std_symbol = symbol.replace("/", "_")
 
-        supabase.table("live_prices").upsert({
+        response = supabase.table("live_prices").upsert({
             "symbol": symbol,
             "standardized_symbol": std_symbol,
             "price": price,
@@ -80,10 +84,11 @@ async def upsert_price(data):
         }).execute()
 
         logger.info(f"✅ {symbol} → {price}")
+        logger.info(f"📝 Upsert response: {response}")
     except Exception as e:
         logger.error(f"❌ Failed to upsert price: {e}")
 
-# Main loop
+# Main WebSocket loop
 async def price_bot_loop():
     reconnect_delay = 2
 
@@ -103,7 +108,7 @@ async def price_bot_loop():
                 }))
                 logger.info(f"📤 Sent subscribe: {','.join(symbols)}")
 
-                # Heartbeat task
+                # Heartbeat
                 async def send_heartbeat():
                     while True:
                         try:
@@ -116,26 +121,26 @@ async def price_bot_loop():
 
                 heartbeat_task = asyncio.create_task(send_heartbeat())
 
+                # Listen for price updates
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=12)
                         data = json.loads(msg)
+                        logger.debug(f"📩 Received: {data}")
 
                         if data.get("event") == "price" and "symbol" in data:
                             await upsert_price(data)
-                        else:
-                            logger.debug(f"Ignored message: {data}")
                     except asyncio.TimeoutError:
-                        logger.warning("⏱️ Timeout. Reconnecting.")
+                        logger.warning("⏱️ No messages. Reconnecting.")
                         break
                     except Exception as e:
-                        logger.error(f"❌ Receive error: {e}")
+                        logger.error(f"❌ WebSocket error: {e}")
                         break
 
                 heartbeat_task.cancel()
 
         except Exception as e:
-            logger.error(f"🔌 WebSocket connection error: {e}")
+            logger.error(f"🔌 Connection error: {e}")
 
         logger.info(f"🔁 Reconnecting in {reconnect_delay} seconds...")
         await asyncio.sleep(reconnect_delay)
