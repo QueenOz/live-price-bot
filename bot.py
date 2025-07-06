@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 from supabase import create_client
 
-# Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -42,29 +41,38 @@ async def fetch_symbols():
                 return []
 
             assets_resp = await client.get(ASSETS_URL, headers=HEADERS, params={
-                "select": "asset_name",
+                "select": "symbol,asset_name,market_type",
                 "game_id": f"in.({','.join(game_ids)})"
             })
-            symbols = list({a["asset_name"] for a in assets_resp.json() if a.get("asset_name")})
-            return symbols[:SYMBOL_LIMIT]
+            raw_assets = assets_resp.json()
+
+            # Use asset_name for forex, symbol for others
+            symbols = set()
+            for a in raw_assets:
+                if a.get("market_type") == "forex" and a.get("asset_name"):
+                    symbols.add(a["asset_name"])
+                elif a.get("symbol"):
+                    symbols.add(a["symbol"])
+
+            return list(symbols)[:SYMBOL_LIMIT]
         except Exception as e:
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
 
 async def upsert_price(data):
     try:
-        symbol = data["symbol"]
+        ws_symbol = data["symbol"]
         price = float(data["price"])
-        std_symbol = symbol.replace("/", "_")
+        std_symbol = ws_symbol.replace("/", "_")
 
         supabase.table("live_prices").upsert({
-            "symbol": symbol,
+            "symbol": ws_symbol,  # store exact ws symbol like EUR/USD
             "standardized_symbol": std_symbol,
             "price": price,
             "updated_at": datetime.utcnow().isoformat()
         }).execute()
 
-        logger.info(f"✅ Price updated: {symbol} → {price}")
+        logger.info(f"✅ Price updated: {ws_symbol} → {price}")
     except Exception as e:
         logger.error(f"❌ Failed to upsert: {e}")
 
@@ -103,4 +111,5 @@ async def price_bot_loop():
 
 if __name__ == "__main__":
     asyncio.run(price_bot_loop())
+
 
