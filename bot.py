@@ -1,3 +1,4 @@
+# bot.py
 import os
 import time
 import json
@@ -32,7 +33,7 @@ SYMBOL_LIMIT = 8
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
         try:
-            # Get active game IDs
+            # Get active or upcoming game IDs
             games_resp = await client.get(GAMES_URL, headers=HEADERS, params={
                 "select": "id",
                 "status": "in.(upcoming,active)"
@@ -41,20 +42,13 @@ async def fetch_symbols():
             if not game_ids:
                 return []
 
-            # Get game asset symbols + market types
+            # Get symbols from active game_assets
             assets_resp = await client.get(ASSETS_URL, headers=HEADERS, params={
-                "select": "symbol,asset_name,market_type",
+                "select": "symbol",
                 "game_id": f"in.({','.join(game_ids)})"
             })
-
-            # Choose correct subscription value
-            symbols = set()
-            for a in assets_resp.json():
-                if a.get("market_type") == "forex" and a.get("asset_name"):
-                    symbols.add(a["asset_name"])
-                elif a.get("symbol"):
-                    symbols.add(a["symbol"])
-            return list(symbols)[:SYMBOL_LIMIT]
+            symbols = list({a["symbol"] for a in assets_resp.json() if a.get("symbol")})
+            return symbols[:SYMBOL_LIMIT]
         except Exception as e:
             logger.error(f"❌ Error fetching symbols: {e}")
             return []
@@ -63,10 +57,11 @@ async def upsert_price(data):
     try:
         symbol = data["symbol"]
         price = float(data["price"])
+        std_symbol = symbol.replace("/", "_")
 
         supabase.table("live_prices").upsert({
             "symbol": symbol,
-            "standardized_symbol": symbol.replace("/", "_"),  # optional for your view
+            "standardized_symbol": std_symbol,
             "price": price,
             "updated_at": datetime.utcnow().isoformat()
         }).execute()
@@ -90,7 +85,7 @@ async def price_bot_loop():
                     "action": "subscribe",
                     "params": {"symbols": ",".join(symbols)}
                 }))
-                logger.info("🟢 Connected to TwelveData WebSocket")
+                logger.info("🟢 Connected to TwelveData")
 
                 while True:
                     try:
@@ -99,9 +94,9 @@ async def price_bot_loop():
                         if "symbol" in data and "price" in data:
                             await upsert_price(data)
                         else:
-                            logger.debug(f"Ignored message: {data}")
+                            logger.debug(f"Ignored: {data}")
                     except asyncio.TimeoutError:
-                        logger.info("⏳ No updates received. Reconnecting.")
+                        logger.info("⏳ No price updates. Refreshing.")
                         break
         except Exception as e:
             logger.error(f"⚠️ WebSocket error: {e}")
@@ -110,6 +105,7 @@ async def price_bot_loop():
 
 if __name__ == "__main__":
     asyncio.run(price_bot_loop())
+
 
 
 
