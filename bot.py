@@ -28,27 +28,39 @@ async def fetch_symbols_loop():
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(FETCH_SYMBOLS_ENDPOINT, headers={
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                    "Content-Type": "application/json"
-                }) as response:
+                async with session.post(
+                    FETCH_SYMBOLS_ENDPOINT,
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                        "Content-Type": "application/json"
+                    }
+                ) as response:
                     data = await response.json()
                     new_symbols = set()
                     new_map = {}
 
                     for row in data.get("symbols", []):
-                        symbol = row.get("symbol")
-                        standardized = row.get("standardized_symbol")
-                        name = row.get("asset_name")
                         market_type = row.get("market_type")
-                        if symbol and standardized:
-                            new_symbols.add(symbol)
-                            new_map[symbol] = {
-                                "standardized_symbol": standardized,
-                                "asset_name": name,
-                                "market_type": market_type or "unknown"
-                            }
+                        name = row.get("asset_name")
+                        standardized = row.get("standardized_symbol")
+                        raw_symbol = row.get("symbol")
+
+                        # ✅ Use standardized_symbol for forex, fallback to asset_name
+                        if market_type == "forex":
+                            resolved_symbol = standardized or name
+                        else:
+                            resolved_symbol = raw_symbol
+
+                        if not resolved_symbol:
+                            continue
+
+                        new_symbols.add(resolved_symbol)
+                        new_map[resolved_symbol] = {
+                            "standardized_symbol": standardized,
+                            "asset_name": name,
+                            "market_type": market_type or "unknown"
+                        }
 
                     symbols = new_symbols
                     symbol_map = new_map
