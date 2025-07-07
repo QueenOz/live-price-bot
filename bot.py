@@ -12,7 +12,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-TD_WEBSOCKET_URL = os.getenv("TD_WEBSOCKET_URL", "wss://ws.twelvedata.com/v1/quotes/price")
+TD_WEBSOCKET_URL = os.getenv("TD_WEBSOCKET_URL") + f"?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -35,14 +35,22 @@ async def fetch_symbols():
 
 async def insert_price(data):
     try:
+        price = data.get("price")
+        if price is None:
+            price = 0
+            status = "failed"
+        else:
+            status = "pulled"
+
         rows = [{
             "symbol": data["symbol"],
-            "price": data["price"],
+            "price": price,
+            "status": status,
             "updated_at": datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z",
             "market_type": data.get("type", "unknown"),
         }]
         result = supabase.table("live_prices").upsert(rows).execute()
-        print(f"✅ Upserted price for {data['symbol']}: {data['price']}")
+        print(f"✅ Upserted price for {data['symbol']}: {price} ({status})")
     except Exception as e:
         print("❌ Error inserting price:", e)
 
