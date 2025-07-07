@@ -44,8 +44,10 @@ async def insert_price(data):
         if price is None:
             price = 0
             status = "failed"
+            print(f"❌ No price for {data['symbol']}, inserting 0")
         else:
             status = "pulled"
+            print(f"✅ Price pulled for {data['symbol']}: {price}")
 
         rows = [{
             "symbol": data["symbol"],
