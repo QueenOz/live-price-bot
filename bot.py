@@ -1,105 +1,144 @@
 import os
-import asyncio
 import json
+import logging
+import asyncio
 import httpx
+import websockets
+from dotenv import load_dotenv
 from datetime import datetime
 from supabase import create_client
-from dotenv import load_dotenv
-from twelvedata_ws import TDWebSocketClient
 
-# ✅ Load environment variables from .env file
+# Load .env variables
 load_dotenv()
-
-# ✅ Get env variables safely
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# ✅ Create Supabase client
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# ✅ Table and endpoints
-SUPABASE_GAME_URL = f"{SUPABASE_URL}/rest/v1"
-headers = {
+SUPABASE_HEADERS = {
     "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
 }
 
-# ✅ Live prices table: upsert rows
-async def save_price(symbol, standardized_symbol, price):
-    await supabase.table("live_prices").upsert({
-        "symbol": symbol,
-        "standardized_symbol": standardized_symbol,
-        "price": price,
-        "updated_at": datetime.utcnow().isoformat()
-    }, on_conflict=["symbol"]).execute()
+WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 
-# ✅ Fetch active/upcoming game assets
+GAMES_URL = f"{SUPABASE_URL}/rest/v1/games"
+ASSETS_URL = f"{SUPABASE_URL}/rest/v1/game_assets"
+SYMBOL_LIMIT = 8
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TDWebSocket")
+
 async def fetch_symbols():
     async with httpx.AsyncClient() as client:
-        # Get active game IDs
-        game_res = await client.get(
-            f"{SUPABASE_GAME_URL}/games?select=id&status=in.(upcoming,active)",
-            headers=headers
-        )
-        game_ids = [g["id"] for g in game_res.json()]
-        if not game_ids:
+        try:
+            games_resp = await client.get(GAMES_URL, headers=SUPABASE_HEADERS, params={
+                "select": "id",
+                "status": "in.(upcoming,active)"
+            })
+            game_ids = [g["id"] for g in games_resp.json()]
+            if not game_ids:
+                return []
+
+            assets_resp = await client.get(ASSETS_URL, headers=SUPABASE_HEADERS, params={
+                "select": "standardized_symbol,market_type,game_status",
+                "game_id": f"in.({','.join(game_ids)})"
+            })
+            rows = assets_resp.json()
+            symbols = set()
+
+            for row in rows:
+                std_symbol = row.get("standardized_symbol")
+                market_type = row.get("market_type")
+
+                if not std_symbol:
+                    continue
+
+                if market_type == "forex":
+                    symbols.add(std_symbol.replace("_", "/"))
+                else:
+                    symbols.add(std_symbol)
+
+            return list(symbols)[:SYMBOL_LIMIT]
+
+        except Exception as e:
+            logger.error(f"❌ Error fetching symbols: {e}")
             return []
 
-        # Get all assets for those games
-        game_ids_str = ",".join(f'"{gid}"' for gid in game_ids)
-        asset_res = await client.get(
-            f"{SUPABASE_GAME_URL}/game_assets"
-            f"?select=symbol,standardized_symbol,market_type,game_status&game_id=in.({game_ids_str})",
-            headers=headers
-        )
-        assets = asset_res.json()
+async def upsert_price(data):
+    try:
+        symbol = data["symbol"]
+        price = float(data["price"])
+        std_symbol = symbol.replace("/", "_")
 
-        # Filter and normalize
-        symbols = []
-        for asset in assets:
-            if asset["game_status"] not in ("active", "upcoming"):
-                continue
-            market = asset["market_type"]
-            std_symbol = asset["standardized_symbol"]
-            if market == "forex":
-                symbol = std_symbol.replace("_", "/")
-            else:
-                symbol = std_symbol
-            symbols.append((symbol, std_symbol))
-        return symbols
+        await supabase.table("live_prices").upsert({
+            "symbol": symbol,
+            "standardized_symbol": std_symbol,
+            "price": price,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
 
-# ✅ Start WebSocket connection
-async def start_ws(symbols):
-    client = TDWebSocketClient(apikey=TWELVE_DATA_API_KEY)
+        logger.info(f"✅ {symbol} → {price}")
+    except Exception as e:
+        logger.error(f"❌ Failed to upsert price: {e}")
 
-    @client.on_message()
-    async def handle_message(msg):
+
+async def price_bot_loop():
+    reconnect_delay = 2
+
+    while True:
         try:
-            data = json.loads(msg)
-            if "price" in data and "symbol" in data:
-                await save_price(
-                    symbol=data["symbol"],
-                    standardized_symbol=data["symbol"].replace("/", "_"),
-                    price=float(data["price"])
-                )
+            symbols = await fetch_symbols()
+            if not symbols:
+                logger.info("⏳ No symbols found. Retrying in 5s.")
+                await asyncio.sleep(5)
+                continue
+
+            logger.info(f"🧠 Subscribing to: {symbols}")
+            async with websockets.connect(WEBSOCKET_URL) as ws:
+                await ws.send(json.dumps({
+                    "action": "subscribe",
+                    "params": {"symbols": ",".join(symbols)}
+                }))
+                logger.info(f"📤 Sent subscribe: {','.join(symbols)}")
+
+                async def send_heartbeat():
+                    while True:
+                        try:
+                            await asyncio.sleep(10)
+                            await ws.send(json.dumps({"action": "heartbeat"}))
+                        except:
+                            break
+
+                heartbeat_task = asyncio.create_task(send_heartbeat())
+
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=15)
+                        data = json.loads(msg)
+                        if data.get("event") == "price" and "symbol" in data:
+                            await upsert_price(data)
+                    except asyncio.TimeoutError:
+                        logger.warning("⏱️ Timeout. Reconnecting.")
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ Receive error: {e}")
+                        break
+
+                heartbeat_task.cancel()
+
         except Exception as e:
-            print(f"⚠️ Error parsing message: {e}")
+            logger.error(f"🔌 WebSocket connection error: {e}")
 
-    await client.connect()
-    for symbol, _ in symbols:
-        print(f"📤 Subscribing to: {symbol}")
-        await client.subscribe(symbol)
-
-# ✅ Main loop
-async def main():
-    symbols = await fetch_symbols()
-    if symbols:
-        await start_ws(symbols)
-    else:
-        print("🛑 No symbols to subscribe to.")
+        logger.info(f"🔁 Reconnecting in {reconnect_delay} seconds...")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, 30)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(price_bot_loop())
+
+
+
 
 
