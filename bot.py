@@ -56,25 +56,33 @@ async def fetch_symbols_loop():
 
 async def insert_price(data):
     try:
-        symbol = data["symbol"]
         price = data.get("price")
-        standardized_symbol = symbol_map.get(symbol)
+        symbol = data.get("symbol")
         status = "pulled" if price is not None else "failed"
-
         if price is None:
             price = 0
             print(f"❌ No price for {symbol}, inserting 0")
         else:
             print(f"✅ Price pulled for {symbol}: {price}")
 
-        rows = [{
+        # Find matching symbol record from the symbols set
+        matched = next((s for s in symbols if s["symbol"] == symbol), None)
+
+        row = {
             "symbol": symbol,
-            "standardized_symbol": standardized_symbol,
             "price": price,
             "status": status,
             "updated_at": datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z",
-            "market_type": data.get("type", "unknown")
-        }]
+            "market_type": data.get("type", "unknown"),
+            "standardized_symbol": matched["standardized_symbol"] if matched else None,
+            "name": matched["asset_name"] if matched else None  # ✅ new field
+        }
+
+        supabase.table("live_prices").upsert([row]).execute()
+        print(f"✅ Upserted price for {symbol}: {price} ({status})")
+    except Exception as e:
+        print("❌ Error inserting price:", e)
+
 
         supabase.table("live_prices").upsert(rows).execute()
         print(f"✅ Upserted price for {symbol}: {price} ({status})")
