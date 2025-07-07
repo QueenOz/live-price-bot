@@ -22,7 +22,6 @@ symbol_map = {}
 previous_symbols = set()
 last_price_time = datetime.now(timezone.utc)
 
-
 async def fetch_symbols_loop():
     global symbols, symbol_map
     while True:
@@ -70,13 +69,12 @@ async def fetch_symbols_loop():
 
         await asyncio.sleep(60)
 
-
 async def insert_price(data):
     global last_price_time
     try:
         price = data.get("price")
         symbol = data.get("symbol")
-        ts = datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z"
+        ts = datetime.fromtimestamp(data["timestamp"], timezone.utc).isoformat()
         status = "pulled" if price is not None else "failed"
         if price is None:
             price = 0
@@ -101,7 +99,6 @@ async def insert_price(data):
     except Exception as e:
         print("❌ Error inserting price:", e)
 
-
 async def send_heartbeat(ws):
     while True:
         try:
@@ -110,7 +107,6 @@ async def send_heartbeat(ws):
         except Exception as e:
             print("💔 Heartbeat failed, triggering reconnect:", e)
             raise e
-
 
 async def check_price_timeout():
     global last_price_time
@@ -122,9 +118,11 @@ async def check_price_timeout():
             print(f"⏱️ No price received in {int(delta)}s, triggering reconnect...")
             raise Exception("Timeout: No price update")
 
-
 async def maintain_connection():
     global previous_symbols
+    heartbeat_task = None
+    timeout_task = None
+
     while True:
         try:
             if not symbols:
@@ -150,8 +148,8 @@ async def maintain_connection():
                     else:
                         print("✅ Symbol list unchanged, skipping re-subscribe")
 
-                    asyncio.create_task(send_heartbeat(ws))
-                    asyncio.create_task(check_price_timeout())
+                    heartbeat_task = asyncio.create_task(send_heartbeat(ws))
+                    timeout_task = asyncio.create_task(check_price_timeout())
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -170,8 +168,12 @@ async def maintain_connection():
                             break
         except Exception as e:
             print("🔁 Reconnecting due to error:", e)
+        finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+            if timeout_task:
+                timeout_task.cancel()
             await asyncio.sleep(3)
-
 
 async def main():
     await asyncio.gather(
@@ -179,9 +181,9 @@ async def main():
         maintain_connection()
     )
 
-
 if __name__ == '__main__':
     asyncio.run(main())
+
 
 
 
