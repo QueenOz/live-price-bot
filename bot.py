@@ -1,3 +1,4 @@
+
 import os
 import json
 import logging
@@ -69,6 +70,8 @@ async def send_heartbeat(ws):
 # WebSocket price streaming
 async def websocket_loop():
     global symbol_list
+    last_subscribed_symbols = []
+
     while True:
         try:
             async with websockets.connect(WEBSOCKET_URL) as ws:
@@ -80,11 +83,24 @@ async def websocket_loop():
                     await asyncio.sleep(10)
                     continue
 
-                await ws.send(json.dumps({
-                    "action": "subscribe",
-                    "params": {"symbols": ",".join(symbol_list)}
-                }))
-                logger.info(f"📤 Subscribed to: {symbol_list}")
+                if sorted(symbol_list) == sorted(last_subscribed_symbols):
+                    logger.info("✅ Symbol list unchanged, skipping re-subscribe")
+                else:
+                    extended_symbols = []
+                    for s in symbol_list:
+                        if "ETH" in s or "BTC" in s:
+                            extended_symbols.append({"symbol": s, "type": "Crypto"})
+                        elif "/" in s:
+                            extended_symbols.append({"symbol": s, "type": "Forex"})
+                        else:
+                            extended_symbols.append({"symbol": s})
+
+                    await ws.send(json.dumps({
+                        "action": "subscribe",
+                        "params": {"symbols": extended_symbols}
+                    }))
+                    logger.info(f"📤 Subscribed to: {extended_symbols}")
+                    last_subscribed_symbols = symbol_list.copy()
 
                 heartbeat = asyncio.create_task(send_heartbeat(ws))
 
@@ -92,20 +108,24 @@ async def websocket_loop():
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=15)
                         data = json.loads(msg)
-                        if data.get("event") == "price":
-                            symbol = data.get("symbol")
-                            price = float(data.get("price", 0))
-                            std_symbol = symbol.replace("/", "_")
-                            market_type = "forex" if "/" in symbol else "stock_or_crypto"
 
-                            price_buffer.append({
-                                "symbol": symbol,
-                                "standardized_symbol": std_symbol,
-                                "price": price,
-                                "updated_at": datetime.utcnow().isoformat(),
-                                "market_type": market_type,
-                                "asset_name": std_symbol
-                            })
+                        if data.get("event") != "price":
+                            continue
+
+                        symbol = data.get("symbol")
+                        price = float(data.get("price", 0))
+                        std_symbol = symbol.replace("/", "_")
+                        market_type = "forex" if "/" in symbol else "stock_or_crypto"
+
+                        price_buffer.append({
+                            "symbol": symbol,
+                            "standardized_symbol": std_symbol,
+                            "price": price,
+                            "updated_at": datetime.utcnow().isoformat(),
+                            "market_type": market_type,
+                            "asset_name": std_symbol
+                        })
+
                     except asyncio.TimeoutError:
                         logger.warning("⚠️ WebSocket timeout")
                         break
@@ -114,6 +134,7 @@ async def websocket_loop():
                         break
 
                 heartbeat.cancel()
+
         except Exception as e:
             logger.error(f"🔌 WebSocket failed: {e}")
 
@@ -124,7 +145,9 @@ async def websocket_loop():
 async def symbol_refresher():
     global symbol_list
     while True:
-        symbol_list = await fetch_symbols()
+        new_symbols = await fetch_symbols()
+        if sorted(new_symbols) != sorted(symbol_list):
+            symbol_list = new_symbols
         await asyncio.sleep(60)
 
 # Flush buffer every 5s
@@ -152,7 +175,7 @@ async def main():
         websocket_loop(),
         symbol_refresher(),
         buffer_flusher(),
-        pull_live_prices()  # optional
+        pull_live_prices()
     )
 
 if __name__ == "__main__":
