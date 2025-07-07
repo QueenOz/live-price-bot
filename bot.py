@@ -1,184 +1,113 @@
-import os
-import json
-import logging
 import asyncio
-import httpx
-import websockets
-from dotenv import load_dotenv
+import json
+import os
 from datetime import datetime
+from dotenv import load_dotenv
+
+import aiohttp
+from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-# Constants
-WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
+TD_WEBSOCKET_URL = os.getenv("TD_WEBSOCKET_URL", "wss://ws.twelvedata.com/v1/quotes/price")
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
-INSERT_LIVE_PRICE_ENDPOINT = f"{SUPABASE_URL}/functions/v1/insert-live-price"
-LIVE_PRICES_ENDPOINT = f"{SUPABASE_URL}/rest/v1/live_prices"
 
-HEADERS = {
-    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    "Content-Type": "application/json"
-}
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TDWebSocket")
+previous_symbols = set()
 
-symbol_list = []
-price_buffer = []
-
-# Fetch symbol list from Edge Function
 async def fetch_symbols():
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(FETCH_SYMBOLS_ENDPOINT, headers=HEADERS)
-            data = resp.json()
-            logger.info(f"🧠 Fetched symbols: {data}")
-            return data.get("symbols", [])
+        async with aiohttp.ClientSession() as session:
+            async with session.post(FETCH_SYMBOLS_ENDPOINT, headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Content-Type": "application/json"
+            }) as response:
+                data = await response.json()
+                return set(data.get("symbols", []))
     except Exception as e:
-        logger.error(f"❌ Error fetching symbols: {e}")
-        return []
+        print("❌ Failed to fetch symbols:", e)
+        return set()
 
-# Send price buffer to Supabase via Edge Function
-async def flush_price_buffer():
-    global price_buffer
-    if not price_buffer:
-        return
+async def insert_price(data):
     try:
-        async with httpx.AsyncClient() as client:
-            payload = {"prices": price_buffer}
-            await client.post(INSERT_LIVE_PRICE_ENDPOINT, headers=HEADERS, json=payload)
-            logger.info(f"📡 Flushed {len(price_buffer)} prices")
-            price_buffer = []
+        rows = [{
+            "symbol": data["symbol"],
+            "price": data["price"],
+            "updated_at": datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z",
+            "market_type": data.get("type", "unknown"),
+        }]
+        result = supabase.table("live_prices").upsert(rows).execute()
+        print(f"✅ Upserted price for {data['symbol']}: {data['price']}")
     except Exception as e:
-        logger.error(f"❌ Failed to flush price buffer: {e}")
+        print("❌ Error inserting price:", e)
 
-# WebSocket heartbeat
 async def send_heartbeat(ws):
     while True:
         try:
             await asyncio.sleep(10)
-            await ws.send(json.dumps({"action": "heartbeat"}))
-        except:
+            await ws.send_str(json.dumps({"action": "heartbeat"}))
+        except Exception as e:
+            print("💔 Heartbeat failed:", e)
             break
 
-# WebSocket price streaming
-async def websocket_loop():
-    global symbol_list
-    last_subscribed_symbols = []
+async def maintain_connection():
+    global previous_symbols
 
     while True:
         try:
-            async with websockets.connect(WEBSOCKET_URL) as ws:
-                if not symbol_list:
-                    symbol_list = await fetch_symbols()
+            symbols = await fetch_symbols()
+            if not symbols:
+                print("⚠️ No symbols to subscribe.")
+                await asyncio.sleep(10)
+                continue
 
-                if not symbol_list:
-                    logger.info("⏳ No symbols to subscribe. Retrying...")
-                    await asyncio.sleep(10)
-                    continue
+            resubscribe = symbols != previous_symbols
+            previous_symbols = symbols
 
-                if sorted(symbol_list) == sorted(last_subscribed_symbols):
-                    logger.info("✅ Symbol list unchanged, skipping re-subscribe")
-                else:
-                    extended_symbols = []
-                    for s in symbol_list:
-                        if "ETH" in s or "BTC" in s:
-                            extended_symbols.append({"symbol": s, "type": "Crypto"})
-                        elif "/" in s:
-                            extended_symbols.append({"symbol": s, "type": "Forex"})
-                        else:
-                            extended_symbols.append({"symbol": s})
-
-                    await ws.send(json.dumps({
-                        "action": "subscribe",
-                        "params": {"symbols": extended_symbols}
-                    }))
-                    logger.info(f"📤 Subscribed to: {extended_symbols}")
-                    last_subscribed_symbols = symbol_list.copy()
-
-                heartbeat = asyncio.create_task(send_heartbeat(ws))
-
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=15)
-                        data = json.loads(msg)
-
-                        if data.get("event") != "price":
-                            continue
-
-                        symbol = data.get("symbol")
-                        price = float(data.get("price", 0))
-                        std_symbol = symbol.replace("/", "_")
-                        market_type = "forex" if "/" in symbol else "stock_or_crypto"
-
-                        price_buffer.append({
-                            "symbol": symbol,
-                            "standardized_symbol": std_symbol,
-                            "price": price,
-                            "updated_at": datetime.utcnow().isoformat(),
-                            "market_type": market_type,
-                            "asset_name": std_symbol
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(TD_WEBSOCKET_URL) as ws:
+                    if resubscribe:
+                        subscribe_payload = json.dumps({
+                            "action": "subscribe",
+                            "params": {
+                                "symbols": ",".join(symbols),
+                                "apikey": TWELVE_DATA_API_KEY
+                            }
                         })
+                        await ws.send_str(subscribe_payload)
+                        print(f"📤 Subscribed to: {symbols}")
+                    else:
+                        print("✅ Symbol list unchanged, skipping re-subscribe")
 
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ WebSocket timeout")
-                        break
-                    except Exception as e:
-                        logger.error(f"❌ WebSocket error: {e}")
-                        break
+                    asyncio.create_task(send_heartbeat(ws))
 
-                heartbeat.cancel()
-
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                if data.get("event") == "price":
+                                    await insert_price(data)
+                                elif data.get("event") == "status":
+                                    print(f"⚙️ Status event: {data}")
+                                else:
+                                    print(f"🪵 Other event: {data}")
+                            except Exception as e:
+                                print("⚠️ Error parsing message:", e)
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            print("❌ WebSocket error:", msg.data)
+                            break
         except Exception as e:
-            logger.error(f"🔌 WebSocket failed: {e}")
+            print("🔁 Reconnecting due to error:", e)
+            await asyncio.sleep(5)
 
-        logger.info("🔁 Reconnecting WebSocket in 2s...")
-        await asyncio.sleep(2)
+if __name__ == '__main__':
+    asyncio.run(maintain_connection())
 
-# Refresh symbols every 60s
-async def symbol_refresher():
-    global symbol_list
-    while True:
-        new_symbols = await fetch_symbols()
-        if sorted(new_symbols) != sorted(symbol_list):
-            symbol_list = new_symbols
-        await asyncio.sleep(60)
-
-# Flush buffer every 5s
-async def buffer_flusher():
-    while True:
-        await flush_price_buffer()
-        await asyncio.sleep(5)
-
-# Optional: Pull latest from live_prices every 2s
-async def pull_live_prices():
-    while True:
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(LIVE_PRICES_ENDPOINT, headers=HEADERS, params={
-                    "select": "symbol,price,updated_at"
-                })
-                logger.info(f"📊 Live prices count: {len(resp.json())}")
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch live prices: {e}")
-        await asyncio.sleep(2)
-
-# Main loop
-async def main():
-    await asyncio.gather(
-        websocket_loop(),
-        symbol_refresher(),
-        buffer_flusher(),
-        pull_live_prices()
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 
