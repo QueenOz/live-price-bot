@@ -17,21 +17,26 @@ FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+# Shared symbols set
+symbols = set()
 previous_symbols = set()
 
-async def fetch_symbols():
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(FETCH_SYMBOLS_ENDPOINT, headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Content-Type": "application/json"
-            }) as response:
-                data = await response.json()
-                return set(data.get("symbols", []))
-    except Exception as e:
-        print("❌ Failed to fetch symbols:", e)
-        return set()
+async def fetch_symbols_loop():
+    global symbols
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(FETCH_SYMBOLS_ENDPOINT, headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Content-Type": "application/json"
+                }) as response:
+                    data = await response.json()
+                    symbols = set(data.get("symbols", []))
+                    print(f"🔄 Refreshed symbols: {symbols}")
+        except Exception as e:
+            print("❌ Failed to fetch symbols:", e)
+        await asyncio.sleep(60)
 
 async def insert_price(data):
     try:
@@ -49,7 +54,7 @@ async def insert_price(data):
             "updated_at": datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z",
             "market_type": data.get("type", "unknown"),
         }]
-        result = supabase.table("live_prices").upsert(rows).execute()
+        supabase.table("live_prices").upsert(rows).execute()
         print(f"✅ Upserted price for {data['symbol']}: {price} ({status})")
     except Exception as e:
         print("❌ Error inserting price:", e)
@@ -68,14 +73,13 @@ async def maintain_connection():
 
     while True:
         try:
-            symbols = await fetch_symbols()
             if not symbols:
                 print("⚠️ No symbols to subscribe.")
                 await asyncio.sleep(10)
                 continue
 
             resubscribe = symbols != previous_symbols
-            previous_symbols = symbols
+            previous_symbols = set(symbols)
 
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(TD_WEBSOCKET_URL) as ws:
@@ -113,8 +117,15 @@ async def maintain_connection():
             print("🔁 Reconnecting due to error:", e)
             await asyncio.sleep(5)
 
+async def main():
+    await asyncio.gather(
+        fetch_symbols_loop(),
+        maintain_connection()
+    )
+
 if __name__ == '__main__':
-    asyncio.run(maintain_connection())
+    asyncio.run(main())
+
 
 
 
