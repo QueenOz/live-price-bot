@@ -17,12 +17,13 @@ FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Shared symbols set
+# Shared sets and maps
 symbols = set()
+symbol_map = {}  # maps "symbol" → "standardized_symbol"
 previous_symbols = set()
 
 async def fetch_symbols_loop():
-    global symbols
+    global symbols, symbol_map
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -32,32 +33,51 @@ async def fetch_symbols_loop():
                     "Content-Type": "application/json"
                 }) as response:
                     data = await response.json()
-                    symbols = set(data.get("symbols", []))
+
+                    # Expecting: [{ symbol: "ETH/USD", standardized_symbol: "ETHUSD" }]
+                    new_symbols = set()
+                    new_symbol_map = {}
+
+                    for row in data.get("symbols", []):
+                        symbol = row.get("symbol")
+                        standardized_symbol = row.get("standardized_symbol")
+                        if symbol and standardized_symbol:
+                            new_symbols.add(symbol)
+                            new_symbol_map[symbol] = standardized_symbol
+
+                    symbols = new_symbols
+                    symbol_map = new_symbol_map
+
                     print(f"🔄 Refreshed symbols: {symbols}")
         except Exception as e:
             print("❌ Failed to fetch symbols:", e)
+
         await asyncio.sleep(60)
 
 async def insert_price(data):
     try:
+        symbol = data["symbol"]
         price = data.get("price")
+        standardized_symbol = symbol_map.get(symbol)
+        status = "pulled" if price is not None else "failed"
+
         if price is None:
             price = 0
-            status = "failed"
-            print(f"❌ No price for {data['symbol']}, inserting 0")
+            print(f"❌ No price for {symbol}, inserting 0")
         else:
-            status = "pulled"
-            print(f"✅ Price pulled for {data['symbol']}: {price}")
+            print(f"✅ Price pulled for {symbol}: {price}")
 
         rows = [{
-            "symbol": data["symbol"],
+            "symbol": symbol,
+            "standardized_symbol": standardized_symbol,
             "price": price,
             "status": status,
             "updated_at": datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z",
-            "market_type": data.get("type", "unknown"),
+            "market_type": data.get("type", "unknown")
         }]
+
         supabase.table("live_prices").upsert(rows).execute()
-        print(f"✅ Upserted price for {data['symbol']}: {price} ({status})")
+        print(f"✅ Upserted price for {symbol}: {price} ({status})")
     except Exception as e:
         print("❌ Error inserting price:", e)
 
