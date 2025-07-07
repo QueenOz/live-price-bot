@@ -1,4 +1,4 @@
-supabase
-websocket-client
-python-dotenv
+supabase>=1.0.0
+websocket-client>=1.6.1
+python-dotenv>=1.0.0
 aiohttp>=3.8.0
