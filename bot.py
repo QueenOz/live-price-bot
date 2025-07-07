@@ -1,12 +1,12 @@
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import aiohttp
 from supabase import create_client, Client
 
-# Load environment variables
+# Load env vars
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -14,13 +14,14 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 TD_WEBSOCKET_URL = os.getenv("TD_WEBSOCKET_URL") + f"?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
-# Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Shared symbol data
-symbols = []  # full symbol rows
-symbol_map = {}  # map symbol → full row
+# Shared state
+symbols = set()
+symbol_map = {}
 previous_symbols = set()
+last_price_time = datetime.now(timezone.utc)
+
 
 async def fetch_symbols_loop():
     global symbols, symbol_map
@@ -33,62 +34,61 @@ async def fetch_symbols_loop():
                     "Content-Type": "application/json"
                 }) as response:
                     data = await response.json()
-
-                    # Example row: { symbol: "EUR/USD", standardized_symbol: "EUR_USD", asset_name: "Euro Dollar", market_type: "forex" }
-                    new_symbols = []
-                    new_symbol_map = {}
+                    new_symbols = set()
+                    new_map = {}
 
                     for row in data.get("symbols", []):
                         symbol = row.get("symbol")
-                        standardized_symbol = row.get("standardized_symbol")
-                        if symbol and standardized_symbol:
-                            new_symbols.append(row)
-                            new_symbol_map[symbol] = row
+                        standardized = row.get("standardized_symbol")
+                        name = row.get("asset_name")
+                        market_type = row.get("market_type")
+                        if symbol and standardized:
+                            new_symbols.add(symbol)
+                            new_map[symbol] = {
+                                "standardized_symbol": standardized,
+                                "asset_name": name,
+                                "market_type": market_type or "unknown"
+                            }
 
                     symbols = new_symbols
-                    symbol_map = new_symbol_map
-
-                    print(f"🔄 Refreshed symbols: {set(symbol_map.keys())}")
+                    symbol_map = new_map
+                    print(f"🔄 Refreshed symbols: {symbols}")
         except Exception as e:
             print("❌ Failed to fetch symbols:", e)
 
         await asyncio.sleep(60)
 
+
 async def insert_price(data):
+    global last_price_time
     try:
         price = data.get("price")
         symbol = data.get("symbol")
-        timestamp = data.get("timestamp")
-        market_type = data.get("type", "unknown")
-
+        ts = datetime.utcfromtimestamp(data["timestamp"]).isoformat() + "Z"
         status = "pulled" if price is not None else "failed"
         if price is None:
             price = 0
             print(f"❌ No price for {symbol}, inserting 0")
         else:
             print(f"✅ Price pulled for {symbol}: {price}")
+            last_price_time = datetime.now(timezone.utc)
 
-        matched = symbol_map.get(symbol)
-
+        asset_info = symbol_map.get(symbol, {})
         row = {
             "symbol": symbol,
-            "standardized_symbol": matched.get("standardized_symbol") if matched else None,
-            "name": matched.get("asset_name") if matched else None,
+            "standardized_symbol": asset_info.get("standardized_symbol"),
+            "name": asset_info.get("asset_name"),
+            "market_type": asset_info.get("market_type"),
             "price": price,
             "status": status,
-            "updated_at": datetime.utcfromtimestamp(timestamp).isoformat() + "Z",
-            "market_type": matched.get("market_type") if matched else market_type
+            "updated_at": ts
         }
 
-        # Only insert if required fields are present
-        if row["standardized_symbol"] and row["market_type"]:
-            supabase.table("live_prices").upsert([row]).execute()
-            print(f"✅ Upserted price for {symbol}: {price} ({status})")
-        else:
-            print(f"⚠️ Skipping insert for {symbol}: missing required fields")
-
+        supabase.table("live_prices").upsert([row]).execute()
+        print(f"✅ Upserted price for {symbol}: {price} ({status})")
     except Exception as e:
         print("❌ Error inserting price:", e)
+
 
 async def send_heartbeat(ws):
     while True:
@@ -96,22 +96,32 @@ async def send_heartbeat(ws):
             await asyncio.sleep(10)
             await ws.send_str(json.dumps({"action": "heartbeat"}))
         except Exception as e:
-            print("💔 Heartbeat failed:", e)
-            break
+            print("💔 Heartbeat failed, triggering reconnect:", e)
+            raise e
+
+
+async def check_price_timeout():
+    global last_price_time
+    while True:
+        await asyncio.sleep(5)
+        now = datetime.now(timezone.utc)
+        delta = (now - last_price_time).total_seconds()
+        if delta > 5:
+            print(f"⏱️ No price received in {int(delta)}s, triggering reconnect...")
+            raise Exception("Timeout: No price update")
+
 
 async def maintain_connection():
     global previous_symbols
-
     while True:
         try:
-            if not symbol_map:
+            if not symbols:
                 print("⚠️ No symbols to subscribe.")
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
                 continue
 
-            current_symbols = set(symbol_map.keys())
-            resubscribe = current_symbols != previous_symbols
-            previous_symbols = current_symbols
+            resubscribe = symbols != previous_symbols
+            previous_symbols = set(symbols)
 
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(TD_WEBSOCKET_URL) as ws:
@@ -119,16 +129,17 @@ async def maintain_connection():
                         subscribe_payload = json.dumps({
                             "action": "subscribe",
                             "params": {
-                                "symbols": ",".join(current_symbols),
+                                "symbols": ",".join(symbols),
                                 "apikey": TWELVE_DATA_API_KEY
                             }
                         })
                         await ws.send_str(subscribe_payload)
-                        print(f"📤 Subscribed to: {current_symbols}")
+                        print(f"📤 Subscribed to: {symbols}")
                     else:
                         print("✅ Symbol list unchanged, skipping re-subscribe")
 
                     asyncio.create_task(send_heartbeat(ws))
+                    asyncio.create_task(check_price_timeout())
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -147,7 +158,8 @@ async def maintain_connection():
                             break
         except Exception as e:
             print("🔁 Reconnecting due to error:", e)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
+
 
 async def main():
     await asyncio.gather(
@@ -155,10 +167,9 @@ async def main():
         maintain_connection()
     )
 
+
 if __name__ == '__main__':
     asyncio.run(main())
-
-
 
 
 
