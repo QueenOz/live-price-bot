@@ -1,11 +1,14 @@
 import asyncio
 import json
 import os
+import signal
+import sys
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import aiohttp
 from supabase import create_client, Client
 import traceback
+import random
 
 # Load env vars
 load_dotenv()
@@ -17,11 +20,26 @@ FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# Shared state
+# Shared state with shutdown control
 symbols = set()
 symbol_map = {}
 previous_symbols = set()
 last_price_time = datetime.now(timezone.utc)
+shutdown_requested = False
+
+# Task monitoring
+fetch_task = None
+connection_task = None
+watchdog_task = None
+
+async def exponential_backoff(attempt, base_delay=1, max_delay=60):
+    """Calculate exponential backoff with jitter"""
+    delay = min(base_delay * (2 ** min(attempt, 6)), max_delay)
+    jitter = random.uniform(0.1, 0.3) * delay
+    final_delay = delay + jitter
+    print(f"⏳ Backing off for {final_delay:.1f}s (attempt #{attempt + 1})")
+    await asyncio.sleep(final_delay)
+    return final_delay
 
 # Error logging with deduplication
 async def log_error_with_deduplication(error_type, severity, message, function_name=None, symbol=None, 
@@ -111,105 +129,127 @@ async def clear_live_prices():
         )
 
 async def fetch_symbols_loop():
-    global symbols, symbol_map
+    """Enhanced fetch loop with exponential backoff and never-give-up attitude"""
+    global symbols, symbol_map, shutdown_requested
+    consecutive_failures = 0
     
-    # Create session once and reuse it
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.post(
-                    FETCH_SYMBOLS_ENDPOINT,
-                    headers={
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                        "Content-Type": "application/json"
+    while not shutdown_requested:
+        session = None
+        try:
+            # Create fresh session for each attempt after failure
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, connect=10)
+            )
+            
+            async with session.post(
+                FETCH_SYMBOLS_ENDPOINT,
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Content-Type": "application/json"
+                }
+            ) as response:
+                
+                if not response.ok:
+                    error_text = await response.text()
+                    consecutive_failures += 1
+                    await log_error_with_deduplication(
+                        error_type="api",
+                        severity="error",
+                        message=f"fetch-symbols API error: HTTP {response.status}",
+                        function_name="fetch_symbols_loop",
+                        request_data={"url": FETCH_SYMBOLS_ENDPOINT, "status": response.status},
+                        response_data={"error": error_text},
+                        active_symbols_count=len(symbols)
+                    )
+                    await exponential_backoff(consecutive_failures, base_delay=5)
+                    continue
+                
+                data = await response.json()
+                fetched_symbols = data.get("symbols", [])
+                
+                # ✅ Check if no symbols returned - clear live_prices table
+                if not fetched_symbols:
+                    print("⚠️ No symbols returned from fetch-symbols endpoint")
+                    await clear_live_prices()
+                    symbols = set()
+                    symbol_map = {}
+                    consecutive_failures += 1
+                    await exponential_backoff(consecutive_failures, base_delay=10)
+                    continue
+                
+                new_symbols = set()
+                new_map = {}
+
+                for row in fetched_symbols:
+                    market_type = row.get("market_type")
+                    name = row.get("asset_name")
+                    standardized = row.get("standardized_symbol")
+                    raw_symbol = row.get("symbol")
+
+                    # ✅ Use standardized_symbol for forex, fallback to asset_name
+                    if market_type == "forex":
+                        resolved_symbol = standardized or name
+                    else:
+                        resolved_symbol = raw_symbol
+
+                    if not resolved_symbol:
+                        continue
+
+                    new_symbols.add(resolved_symbol)
+                    new_map[resolved_symbol] = {
+                        "standardized_symbol": standardized,
+                        "asset_name": name,
+                        "market_type": market_type or "unknown"
                     }
-                ) as response:
-                    
-                    if not response.ok:
-                        error_text = await response.text()
-                        await log_error_with_deduplication(
-                            error_type="api",
-                            severity="error",
-                            message=f"fetch-symbols API error: HTTP {response.status}",
-                            function_name="fetch_symbols_loop",
-                            request_data={"url": FETCH_SYMBOLS_ENDPOINT, "status": response.status},
-                            response_data={"error": error_text},
-                            active_symbols_count=len(symbols)
-                        )
-                        await asyncio.sleep(60)
-                        continue
-                    
-                    data = await response.json()
-                    fetched_symbols = data.get("symbols", [])
-                    
-                    # ✅ Check if no symbols returned - clear live_prices table
-                    if not fetched_symbols:
-                        print("⚠️ No symbols returned from fetch-symbols endpoint")
-                        await clear_live_prices()
-                        symbols = set()
-                        symbol_map = {}
-                        await asyncio.sleep(60)
-                        continue
-                    
-                    new_symbols = set()
-                    new_map = {}
 
-                    for row in fetched_symbols:
-                        market_type = row.get("market_type")
-                        name = row.get("asset_name")
-                        standardized = row.get("standardized_symbol")
-                        raw_symbol = row.get("symbol")
-
-                        # ✅ Use standardized_symbol for forex, fallback to asset_name
-                        if market_type == "forex":
-                            resolved_symbol = standardized or name
-                        else:
-                            resolved_symbol = raw_symbol
-
-                        if not resolved_symbol:
-                            continue
-
-                        new_symbols.add(resolved_symbol)
-                        new_map[resolved_symbol] = {
-                            "standardized_symbol": standardized,
-                            "asset_name": name,
-                            "market_type": market_type or "unknown"
-                        }
-
-                    symbols = new_symbols
-                    symbol_map = new_map
-                    print(f"🔄 Refreshed symbols: {len(symbols)} symbols loaded")
-                    
-            except aiohttp.ClientError as e:
-                await log_error_with_deduplication(
-                    error_type="api",
-                    severity="error",
-                    message=f"HTTP client error in fetch_symbols_loop: {str(e)}",
-                    function_name="fetch_symbols_loop",
-                    stack_trace=traceback.format_exc(),
-                    active_symbols_count=len(symbols)
-                )
-            except json.JSONDecodeError as e:
-                await log_error_with_deduplication(
-                    error_type="parsing",
-                    severity="error",
-                    message=f"JSON parsing error in fetch_symbols_loop: {str(e)}",
-                    function_name="fetch_symbols_loop",
-                    stack_trace=traceback.format_exc(),
-                    active_symbols_count=len(symbols)
-                )
-            except Exception as e:
-                await log_error_with_deduplication(
-                    error_type="symbol_fetch",
-                    severity="error",
-                    message=f"Unexpected error in fetch_symbols_loop: {str(e)}",
-                    function_name="fetch_symbols_loop",
-                    stack_trace=traceback.format_exc(),
-                    active_symbols_count=len(symbols)
-                )
-
-            await asyncio.sleep(60)
+                symbols = new_symbols
+                symbol_map = new_map
+                consecutive_failures = 0  # Reset on success
+                print(f"🔄 Refreshed symbols: {len(symbols)} symbols loaded")
+                
+                # Normal interval between successful fetches
+                await asyncio.sleep(60)
+                
+        except asyncio.CancelledError:
+            print("🛑 fetch_symbols_loop cancelled")
+            break
+        except aiohttp.ClientError as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="api",
+                severity="error",
+                message=f"HTTP client error in fetch_symbols_loop: {str(e)}",
+                function_name="fetch_symbols_loop",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+            await exponential_backoff(consecutive_failures, base_delay=5)
+        except json.JSONDecodeError as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="parsing",
+                severity="error",
+                message=f"JSON parsing error in fetch_symbols_loop: {str(e)}",
+                function_name="fetch_symbols_loop",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+            await exponential_backoff(consecutive_failures, base_delay=5)
+        except Exception as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="symbol_fetch",
+                severity="error",
+                message=f"Unexpected error in fetch_symbols_loop: {str(e)}",
+                function_name="fetch_symbols_loop",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+            await exponential_backoff(consecutive_failures, base_delay=5)
+        finally:
+            if session and not session.closed:
+                await session.close()
 
 async def insert_price(data):
     global last_price_time
@@ -260,10 +300,12 @@ async def insert_price(data):
         )
 
 async def send_heartbeat(ws):
-    while True:
+    while not shutdown_requested:
         try:
             await asyncio.sleep(10)
             await ws.send_str(json.dumps({"action": "heartbeat"}))
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             await log_error_with_deduplication(
                 error_type="heartbeat",
@@ -277,150 +319,355 @@ async def send_heartbeat(ws):
             raise e
 
 async def check_price_timeout():
-    global last_price_time
-    while True:
-        await asyncio.sleep(5)
-        now = datetime.now(timezone.utc)
-        delta = (now - last_price_time).total_seconds()
-        if delta > 5:
-            await log_error_with_deduplication(
-                error_type="timeout",
-                severity="warning",
-                message=f"No price received in {int(delta)} seconds, triggering reconnect",
-                function_name="check_price_timeout",
-                connection_state="timeout",
-                active_symbols_count=len(symbols)
-            )
-            raise Exception("Timeout: No price update")
+    global last_price_time, shutdown_requested
+    while not shutdown_requested:
+        try:
+            await asyncio.sleep(5)
+            now = datetime.now(timezone.utc)
+            delta = (now - last_price_time).total_seconds()
+            if delta > 30:  # Increased timeout to 30 seconds
+                await log_error_with_deduplication(
+                    error_type="timeout",
+                    severity="warning",
+                    message=f"No price received in {int(delta)} seconds, triggering reconnect",
+                    function_name="check_price_timeout",
+                    connection_state="timeout",
+                    active_symbols_count=len(symbols)
+                )
+                raise Exception("Timeout: No price update")
+        except asyncio.CancelledError:
+            break
 
 async def maintain_connection():
-    global previous_symbols
+    """Enhanced connection with exponential backoff and never-give-up attitude"""
+    global previous_symbols, shutdown_requested
+    consecutive_failures = 0
     heartbeat_task = None
     timeout_task = None
 
-    # Create session once and reuse it for WebSocket connections
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                if not symbols:
-                    print("⚠️ No symbols to subscribe.")
-                    await asyncio.sleep(5)
-                    continue
+    while not shutdown_requested:
+        session = None
+        try:
+            if not symbols:
+                print("⚠️ No symbols to subscribe.")
+                await asyncio.sleep(5)
+                continue
 
-                resubscribe = symbols != previous_symbols
-                previous_symbols = set(symbols)
+            resubscribe = symbols != previous_symbols
+            previous_symbols = set(symbols)
 
-                async with session.ws_connect(TD_WEBSOCKET_URL) as ws:
-                    if resubscribe:
-                        subscribe_payload = json.dumps({
-                            "action": "subscribe",
-                            "params": {
-                                "symbols": ",".join(symbols),
-                                "apikey": TWELVE_DATA_API_KEY
-                            }
-                        })
-                        await ws.send_str(subscribe_payload)
-                        print(f"📤 Subscribed to: {len(symbols)} symbols")
-                    else:
-                        print("✅ Symbol list unchanged, skipping re-subscribe")
+            # Create fresh session for each connection attempt
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60, connect=15)
+            )
 
-                    heartbeat_task = asyncio.create_task(send_heartbeat(ws))
-                    timeout_task = asyncio.create_task(check_price_timeout())
+            print(f"🔗 Connecting to WebSocket... (failures: {consecutive_failures})")
+            async with session.ws_connect(
+                TD_WEBSOCKET_URL,
+                heartbeat=30
+            ) as ws:
+                consecutive_failures = 0  # Reset on successful connection
+                
+                if resubscribe:
+                    subscribe_payload = json.dumps({
+                        "action": "subscribe",
+                        "params": {
+                            "symbols": ",".join(symbols),
+                            "apikey": TWELVE_DATA_API_KEY
+                        }
+                    })
+                    await ws.send_str(subscribe_payload)
+                    print(f"📤 Subscribed to: {len(symbols)} symbols")
+                else:
+                    print("✅ Symbol list unchanged, skipping re-subscribe")
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                                if data.get("event") == "price":
-                                    await insert_price(data)
-                                elif data.get("event") == "status":
-                                    print(f"⚙️ Status event: {data}")
-                                else:
-                                    print(f"🪵 Other event: {data}")
-                            except json.JSONDecodeError as e:
-                                await log_error_with_deduplication(
-                                    error_type="parsing",
-                                    severity="warning",
-                                    message=f"Error parsing WebSocket message: {str(e)}",
-                                    function_name="maintain_connection",
-                                    connection_state="connected",
-                                    response_data={"raw_message": msg.data},
-                                    active_symbols_count=len(symbols)
-                                )
-                            except Exception as e:
-                                await log_error_with_deduplication(
-                                    error_type="websocket",
-                                    severity="error",
-                                    message=f"Error processing WebSocket message: {str(e)}",
-                                    function_name="maintain_connection",
-                                    connection_state="connected",
-                                    stack_trace=traceback.format_exc(),
-                                    active_symbols_count=len(symbols)
-                                )
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
+                timeout_task = asyncio.create_task(check_price_timeout())
+
+                async for msg in ws:
+                    if shutdown_requested:
+                        break
+                        
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                            if data.get("event") == "price":
+                                await insert_price(data)
+                            elif data.get("event") == "status":
+                                print(f"⚙️ Status event: {data}")
+                            else:
+                                print(f"🪵 Other event: {data}")
+                        except json.JSONDecodeError as e:
+                            await log_error_with_deduplication(
+                                error_type="parsing",
+                                severity="warning",
+                                message=f"Error parsing WebSocket message: {str(e)}",
+                                function_name="maintain_connection",
+                                connection_state="connected",
+                                response_data={"raw_message": msg.data},
+                                active_symbols_count=len(symbols)
+                            )
+                        except Exception as e:
                             await log_error_with_deduplication(
                                 error_type="websocket",
                                 severity="error",
-                                message=f"WebSocket error: {msg.data}",
+                                message=f"Error processing WebSocket message: {str(e)}",
                                 function_name="maintain_connection",
-                                connection_state="error",
-                                response_data={"error_data": str(msg.data)},
+                                connection_state="connected",
+                                stack_trace=traceback.format_exc(),
                                 active_symbols_count=len(symbols)
                             )
-                            break
-                            
-            except aiohttp.ClientError as e:
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        await log_error_with_deduplication(
+                            error_type="websocket",
+                            severity="error",
+                            message=f"WebSocket error: {msg.data}",
+                            function_name="maintain_connection",
+                            connection_state="error",
+                            response_data={"error_data": str(msg.data)},
+                            active_symbols_count=len(symbols)
+                        )
+                        break
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        print("🔌 WebSocket closed by server")
+                        break
+                        
+        except asyncio.CancelledError:
+            print("🛑 maintain_connection cancelled")
+            break
+        except aiohttp.ClientError as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="connection",
+                severity="error",
+                message=f"WebSocket connection error: {str(e)}",
+                function_name="maintain_connection",
+                connection_state="failed",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+        except Exception as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="connection",
+                severity="error",
+                message=f"Unexpected error in maintain_connection: {str(e)}",
+                function_name="maintain_connection",
+                connection_state="failed",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+        finally:
+            # Clean up tasks
+            if heartbeat_task and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                    
+            if timeout_task and not timeout_task.done():
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Clean up session
+            if session and not session.closed:
+                await session.close()
+            
+            # Exponential backoff before reconnecting (only if there were failures)
+            if consecutive_failures > 0 and not shutdown_requested:
+                await exponential_backoff(consecutive_failures, base_delay=3, max_delay=30)
+            else:
+                await asyncio.sleep(1)  # Brief pause on normal disconnect
+
+async def watchdog():
+    """Monitor system health and restart tasks if they die"""
+    global fetch_task, connection_task, shutdown_requested
+    print("🐕 Starting watchdog...")
+    
+    while not shutdown_requested:
+        try:
+            await asyncio.sleep(15)  # Check every 15 seconds
+            
+            # Check if fetch task is still running
+            if fetch_task and fetch_task.done():
+                exception = fetch_task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="task_failure",
+                        severity="critical",
+                        message=f"fetch_symbols_loop task died: {str(exception)}",
+                        function_name="watchdog",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+                
+                print("🚨 fetch_symbols_loop task died, restarting...")
+                fetch_task = asyncio.create_task(fetch_symbols_loop())
+            
+            # Check if connection task is still running
+            if connection_task and connection_task.done():
+                exception = connection_task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="task_failure",
+                        severity="critical",
+                        message=f"maintain_connection task died: {str(exception)}",
+                        function_name="watchdog",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+                
+                print("🚨 maintain_connection task died, restarting...")
+                connection_task = asyncio.create_task(maintain_connection())
+            
+            # Check system health
+            now = datetime.now(timezone.utc)
+            time_since_price = (now - last_price_time).total_seconds()
+            
+            if time_since_price > 300:  # 5 minutes without price
                 await log_error_with_deduplication(
-                    error_type="connection",
-                    severity="error",
-                    message=f"WebSocket connection error: {str(e)}",
-                    function_name="maintain_connection",
-                    connection_state="failed",
-                    stack_trace=traceback.format_exc(),
+                    error_type="health_check",
+                    severity="critical",
+                    message=f"No price updates for {int(time_since_price)} seconds - system may be stalled",
+                    function_name="watchdog",
                     active_symbols_count=len(symbols)
                 )
-            except Exception as e:
-                await log_error_with_deduplication(
-                    error_type="connection",
-                    severity="error",
-                    message=f"Unexpected error in maintain_connection: {str(e)}",
-                    function_name="maintain_connection",
-                    connection_state="failed",
-                    stack_trace=traceback.format_exc(),
-                    active_symbols_count=len(symbols)
-                )
-            finally:
-                if heartbeat_task:
-                    heartbeat_task.cancel()
-                if timeout_task:
-                    timeout_task.cancel()
-                await asyncio.sleep(3)
+                print(f"💔 Health check failed - no prices for {int(time_since_price)}s")
+            else:
+                print("💚 Health check passed")
+            
+        except asyncio.CancelledError:
+            print("🛑 Watchdog cancelled")
+            break
+        except Exception as e:
+            await log_error_with_deduplication(
+                error_type="watchdog",
+                severity="error",
+                message=f"Watchdog error: {str(e)}",
+                function_name="watchdog",
+                stack_trace=traceback.format_exc()
+            )
+
+def handle_shutdown(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global shutdown_requested
+    print(f"\n🛑 Received signal {signum}, initiating graceful shutdown...")
+    shutdown_requested = True
+
+async def graceful_shutdown():
+    """Cancel all tasks gracefully"""
+    global fetch_task, connection_task, watchdog_task
+    print("🛑 Shutting down gracefully...")
+    
+    tasks_to_cancel = []
+    if fetch_task and not fetch_task.done():
+        tasks_to_cancel.append(fetch_task)
+    if connection_task and not connection_task.done():
+        tasks_to_cancel.append(connection_task)
+    if watchdog_task and not watchdog_task.done():
+        tasks_to_cancel.append(watchdog_task)
+    
+    for task in tasks_to_cancel:
+        task.cancel()
+    
+    if tasks_to_cancel:
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+    
+    await log_error_with_deduplication(
+        error_type="shutdown",
+        severity="info",
+        message="Trading bot shutdown gracefully",
+        function_name="graceful_shutdown"
+    )
+    print("✅ All tasks cancelled, goodbye!")
 
 async def main():
-    try:
-        print("🚀 Starting trading bot...")
-        await log_error_with_deduplication(
-            error_type="startup",
-            severity="info",
-            message="Trading bot started successfully",
-            function_name="main",
-            active_symbols_count=0
-        )
-        
-        await asyncio.gather(
-            fetch_symbols_loop(),
-            maintain_connection()
-        )
-    except Exception as e:
-        await log_error_with_deduplication(
-            error_type="startup",
-            severity="fatal",
-            message=f"Critical error in main: {str(e)}",
-            function_name="main",
-            stack_trace=traceback.format_exc(),
-            active_symbols_count=len(symbols)
-        )
-        raise
+    """Enhanced main with task supervision and auto-restart"""
+    global fetch_task, connection_task, watchdog_task, shutdown_requested
+    restart_count = 0
+    max_restarts = 10
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    
+    while restart_count < max_restarts and not shutdown_requested:
+        try:
+            print(f"🚀 Starting enhanced trading bot (restart #{restart_count})...")
+            
+            await log_error_with_deduplication(
+                error_type="startup",
+                severity="info",
+                message=f"Trading bot started (restart #{restart_count})",
+                function_name="main",
+                active_symbols_count=0
+            )
+            
+            # Start all core tasks
+            fetch_task = asyncio.create_task(fetch_symbols_loop())
+            connection_task = asyncio.create_task(maintain_connection())
+            watchdog_task = asyncio.create_task(watchdog())
+            
+            # Wait for any task to complete (which shouldn't happen unless shutdown)
+            done, pending = await asyncio.wait(
+                [fetch_task, connection_task, watchdog_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            if shutdown_requested:
+                break
+            
+            # If we get here, a core task died unexpectedly
+            restart_count += 1
+            for task in done:
+                exception = task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="task_crash",
+                        severity="fatal",
+                        message=f"Core task crashed: {str(exception)}",
+                        function_name="main",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+            
+            print(f"💥 Core task died, restarting entire bot (attempt {restart_count}/{max_restarts})...")
+            
+            # Cancel remaining tasks
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            
+            # Exponential backoff before restart
+            if restart_count < max_restarts:
+                await exponential_backoff(restart_count, base_delay=5, max_delay=120)
+            
+        except Exception as e:
+            restart_count += 1
+            await log_error_with_deduplication(
+                error_type="main_crash",
+                severity="fatal",
+                message=f"Main function crashed: {str(e)}",
+                function_name="main",
+                stack_trace=traceback.format_exc()
+            )
+            
+            if restart_count < max_restarts:
+                print(f"💀 Main crashed, restarting in 10s... (attempt {restart_count}/{max_restarts})")
+                await asyncio.sleep(10)
+            else:
+                print("💀 Max restarts reached, giving up!")
+                raise
+    
+    # Graceful shutdown
+    await graceful_shutdown()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted by user")
+    except Exception as e:
+        print(f"💀 Fatal error: {e}")
+        sys.exit(1)
