@@ -83,13 +83,21 @@ async def log_error_with_deduplication(error_type, severity, message, function_n
 async def clear_live_prices():
     """Clear all rows from live_prices table"""
     try:
-        result = supabase.table("live_prices").delete().neq("id", 0).execute()
-        print(f"🗑️ Cleared {len(result.data) if result.data else 0} rows from live_prices table")
+        # First, get count of existing rows to report how many we're deleting
+        existing_data = supabase.table("live_prices").select("symbol").execute()
+        row_count = len(existing_data.data) if existing_data.data else 0
+        
+        if row_count > 0:
+            # ✅ This works - deletes all rows where symbol is not empty string
+            result = supabase.table("live_prices").delete().neq("symbol", "").execute()
+            print(f"🗑️ Cleared {row_count} rows from live_prices table")
+        else:
+            print("🗑️ live_prices table was already empty")
         
         await log_error_with_deduplication(
             error_type="symbol_fetch",
             severity="warning", 
-            message="No symbols returned from fetch-symbols, cleared live_prices table",
+            message=f"No symbols returned from fetch-symbols, cleared {row_count} rows from live_prices table",
             function_name="fetch_symbols_loop",
             active_symbols_count=0
         )
@@ -416,9 +424,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
-
-
-
-
-
