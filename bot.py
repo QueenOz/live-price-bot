@@ -250,7 +250,7 @@ async def insert_price(data):
         symbol = data.get("symbol")
         ts = datetime.fromtimestamp(data["timestamp"], timezone.utc).isoformat()
         status = "pulled" if price is not None else "failed"
-        
+
         if price is None:
             price = 0
             await log_error_with_deduplication(
@@ -266,19 +266,53 @@ async def insert_price(data):
             last_price_time = datetime.now(timezone.utc)
 
         asset_info = symbol_map.get(symbol, {})
+
         row = {
             "symbol": symbol,
             "standardized_symbol": asset_info.get("standardized_symbol"),
-            "name": asset_info.get("asset_name"),
+            "search_symbol": symbol.replace("/", "").upper(),
+            "asset_name": asset_info.get("asset_name"),
             "market_type": asset_info.get("market_type"),
+            "exchange": asset_info.get("exchange"),
             "price": price,
             "status": status,
             "updated_at": ts
         }
 
-        supabase.table("live_prices").upsert([row]).execute()
-        print(f"✅ Upserted price for {symbol}: {price} ({status})")
-        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    f"{SUPABASE_URL}/functions/v1/insert-live-price",
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"prices": [row]}
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        await log_error_with_deduplication(
+                            error_type="edge_insert",
+                            severity="error",
+                            message=f"Edge insert-live-price failed: HTTP {resp.status}",
+                            function_name="insert_price",
+                            symbol=symbol,
+                            response_data={"error": error_text},
+                            request_data=row
+                        )
+                    else:
+                        print(f"✅ [Edge] Price inserted for {symbol}: {price}")
+            except Exception as e:
+                await log_error_with_deduplication(
+                    error_type="edge_insert",
+                    severity="error",
+                    message=f"Edge insert-live-price exception: {str(e)}",
+                    function_name="insert_price",
+                    symbol=symbol,
+                    request_data=row,
+                    stack_trace=traceback.format_exc()
+                )
+
     except Exception as e:
         await log_error_with_deduplication(
             error_type="price_insert",
@@ -290,6 +324,7 @@ async def insert_price(data):
             request_data=data,
             active_symbols_count=len(symbols)
         )
+
 
 async def send_heartbeat(ws):
     while not shutdown_requested:
