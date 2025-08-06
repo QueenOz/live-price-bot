@@ -180,21 +180,21 @@ async def fetch_symbols_loop():
                 
                 new_symbols = set()
                 new_map = {}
+                for row in fetched_symbols:
+                    symbol_str = row.get("symbol")
+                    if not symbol_str:
+                        continue  # skip empty
 
-               for row in fetched_symbols:
-    symbol_str = row.get("symbol")
-    if not symbol_str:
-        continue  # skip empty
+                    new_symbols.add(symbol_str)
+                    new_map[symbol_str] = {
+                        "market_id": row.get("market_id"),
+                        "symbol": symbol_str,
+                        "standardized_symbol": row.get("standardized_symbol"),
+                        "asset_name": row.get("asset_name"),
+                        "market_type": row.get("market_type") or "unknown",
+                        "exchange": row.get("exchange") or None
+                    }
 
-    new_symbols.add(symbol_str)
-    new_map[symbol_str] = {
-        "market_id": row.get("market_id"),
-        "symbol": symbol_str,
-        "standardized_symbol": row.get("standardized_symbol"),
-        "asset_name": row.get("asset_name"),
-        "market_type": row.get("market_type") or "unknown",
-        "exchange": row.get("exchange") or None
-    }
                 symbols = new_symbols
                 symbol_map = new_map
                 consecutive_failures = 0  # Reset on success
