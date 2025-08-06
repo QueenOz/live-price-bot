@@ -182,26 +182,22 @@ async def fetch_symbols_loop():
                 new_map = {}
 
                 for row in fetched_symbols:
-                    market_type = row.get("market_type")
-                    name = row.get("asset_name")
-                    standardized = row.get("standardized_symbol")
-                    raw_symbol = row.get("symbol")
+    market_type = row.get("market_type")
+    name = row.get("asset_name")
+    standardized = row.get("standardized_symbol")
 
-                    # ✅ Use standardized_symbol for forex, fallback to asset_name
-                    if market_type == "forex":
-                        resolved_symbol = standardized or name
-                    else:
-                        resolved_symbol = raw_symbol
+    resolved_symbol = standardized or name  # ✅ One rule to choose
 
-                    if not resolved_symbol:
-                        continue
+    if not resolved_symbol:
+        continue
 
-                    new_symbols.add(resolved_symbol)
-                    new_map[resolved_symbol] = {
-                        "standardized_symbol": standardized,
-                        "asset_name": name,
-                        "market_type": market_type or "unknown"
-                    }
+    new_symbols.add(resolved_symbol)
+    new_map[resolved_symbol] = {
+        "standardized_symbol": standardized,
+        "asset_name": name,
+        "market_type": market_type or "unknown"
+    }
+
 
                 symbols = new_symbols
                 symbol_map = new_map
