@@ -252,6 +252,7 @@ async def fetch_symbols_loop():
 async def insert_price(data):
     async def receive_price(data):
     global price_buffer, last_price_time
+
     symbol = data.get("symbol")
     price = data.get("price")
     timestamp = data.get("timestamp")
@@ -282,6 +283,21 @@ async def insert_price(data):
         "search_symbol": matched.get("standardized_symbol", symbol),
         "exchange": matched.get("exchange", None)
     }
+async def insert_prices_loop():
+    global price_buffer, last_insert_time
+
+    while not shutdown_requested:
+        now = datetime.now(timezone.utc)
+        elapsed = now - last_insert_time
+
+        if elapsed >= BATCH_INTERVAL and price_buffer:
+            batch = list(price_buffer.values())
+            price_buffer.clear()
+            last_insert_time = now
+            print(f"📤 Inserting batch of {len(batch)} prices")
+            await insert_price_batch(batch)
+        
+        await asyncio.sleep(5)
 
 
         async with aiohttp.ClientSession() as session:
@@ -617,10 +633,10 @@ async def graceful_shutdown():
 
 async def main():
     await asyncio.gather(
-        websocket_price_handler(),
-        fetch_symbols_loop(),
-        insert_prices_loop()
-    )
+    fetch_symbols_loop(),
+    websocket_price_handler(),
+    insert_prices_loop()  # ✅ this is new!
+)
 
 async def main():
     """Enhanced main with task supervision and auto-restart"""
