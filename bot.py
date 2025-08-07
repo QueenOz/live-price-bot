@@ -14,8 +14,6 @@ price_buffer = {}
 last_insert_time = datetime.now(timezone.utc)
 BATCH_INTERVAL = timedelta(seconds=15)
 
-
-
 # Load env vars
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -276,12 +274,13 @@ async def receive_price(data):
         "standardized_symbol": matched.get("standardized_symbol", symbol),
         "price": price,
         "updated_at": ts,
-        "name": matched.get("asset_name", symbol),
+        "asset_name": matched.get("asset_name", symbol),  # ✅ Changed from "name" to "asset_name"
         "market_type": matched.get("market_type", "unknown"),
         "status": status,
         "search_symbol": matched.get("standardized_symbol", symbol),
         "exchange": matched.get("exchange", None)
     }
+
 async def insert_prices_loop():
     global price_buffer, last_insert_time
 
@@ -297,7 +296,6 @@ async def insert_prices_loop():
             await insert_price_batch(batch)
         
         await asyncio.sleep(5)
-
 
 async def insert_price_batch(batch):
     for row in batch:
@@ -319,7 +317,7 @@ async def insert_price_batch(batch):
                             error_type="edge_insert",
                             severity="error",
                             message=f"Edge insert-live-price failed: HTTP {resp.status}",
-                            function_name="insert_price",
+                            function_name="insert_price_batch",
                             symbol=symbol,
                             response_data={"error": error_text},
                             request_data=row
@@ -331,14 +329,11 @@ async def insert_price_batch(batch):
                 error_type="edge_insert",
                 severity="error",
                 message=f"Edge insert-live-price exception: {str(e)}",
-                function_name="insert_price",
+                function_name="insert_price_batch",
                 symbol=symbol,
                 request_data=row,
                 stack_trace=traceback.format_exc()
             )
-
-
-
 
 async def send_heartbeat(ws):
     while not shutdown_requested:
@@ -433,7 +428,7 @@ async def maintain_connection():
                         try:
                             data = json.loads(msg.data)
                             if data.get("event") == "price":
-                                await insert_price(data)
+                                await receive_price(data)  # ✅ Fixed: Call receive_price instead of insert_price
                             elif data.get("event") == "status":
                                 print(f"⚙️ Status event: {data}")
                             else:
@@ -624,7 +619,6 @@ async def graceful_shutdown():
     )
     print("✅ All tasks cancelled, goodbye!")
 
-
 async def main():
     """Enhanced main with task supervision and auto-restart"""
     global fetch_task, connection_task, watchdog_task, shutdown_requested
@@ -650,11 +644,12 @@ async def main():
             # Start all core tasks
             fetch_task = asyncio.create_task(fetch_symbols_loop())
             connection_task = asyncio.create_task(maintain_connection())
+            insert_task = asyncio.create_task(insert_prices_loop())  # ✅ Added missing insert_prices_loop task
             watchdog_task = asyncio.create_task(watchdog())
             
             # Wait for any task to complete (which shouldn't happen unless shutdown)
             done, pending = await asyncio.wait(
-                [fetch_task, connection_task, watchdog_task],
+                [fetch_task, connection_task, insert_task, watchdog_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
             
@@ -701,14 +696,6 @@ async def main():
             else:
                 print("💀 Max restarts reached, giving up!")
                 raise
-                
-async def main():
-    await asyncio.gather(
-        fetch_symbols_loop(),
-        maintain_connection(),   # ✅ This is the WebSocket loop
-        insert_prices_loop()     # ✅ This inserts buffered prices in batch
-    )
-
 
 if __name__ == '__main__':
     try:
