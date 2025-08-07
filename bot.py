@@ -301,8 +301,8 @@ async def insert_prices_loop():
 
 async def insert_price_batch(batch):
     for row in batch:
-        symbol = row["symbol"]
-        price = row["price"]
+        symbol = row.get("symbol")
+        price = row.get("price")
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -336,6 +336,7 @@ async def insert_price_batch(batch):
                 request_data=row,
                 stack_trace=traceback.format_exc()
             )
+
 
 
 
