@@ -10,6 +10,12 @@ from supabase import create_client, Client
 import traceback
 import random
 
+price_buffer = {}
+last_insert_time = datetime.now(timezone.utc)
+BATCH_INTERVAL = timedelta(seconds=15)
+
+
+
 # Load env vars
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -609,6 +615,13 @@ async def graceful_shutdown():
         function_name="graceful_shutdown"
     )
     print("✅ All tasks cancelled, goodbye!")
+
+async def main():
+    await asyncio.gather(
+        websocket_price_handler(),
+        fetch_symbols_loop(),
+        insert_prices_loop()
+    )
 
 async def main():
     """Enhanced main with task supervision and auto-restart"""
