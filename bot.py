@@ -631,12 +631,6 @@ async def graceful_shutdown():
     )
     print("✅ All tasks cancelled, goodbye!")
 
-async def main():
-    await asyncio.gather(
-    fetch_symbols_loop(),
-    websocket_price_handler(),
-    insert_prices_loop()  # ✅ this is new!
-)
 
 async def main():
     """Enhanced main with task supervision and auto-restart"""
@@ -715,8 +709,13 @@ async def main():
                 print("💀 Max restarts reached, giving up!")
                 raise
     
-    # Graceful shutdown
-    await graceful_shutdown()
+  async def main():
+    # Run all loops together
+    await asyncio.gather(
+        fetch_symbols_loop(),
+        websocket_price_handler(),
+        insert_prices_loop()  # ✅ Insert batched prices
+    )
 
 if __name__ == '__main__':
     try:
@@ -726,3 +725,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"💀 Fatal error: {e}")
         sys.exit(1)
+
