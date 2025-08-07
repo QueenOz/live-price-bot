@@ -702,14 +702,13 @@ async def main():
                 print("💀 Max restarts reached, giving up!")
                 raise
                 
-
 async def main():
-    # Run all loops together
     await asyncio.gather(
         fetch_symbols_loop(),
-        websocket_price_handler(),
-        insert_prices_loop()  # ✅ Insert batched prices
+        maintain_connection(),   # ✅ This is the WebSocket loop
+        insert_prices_loop()     # ✅ This inserts buffered prices in batch
     )
+
 
 if __name__ == '__main__':
     try:
