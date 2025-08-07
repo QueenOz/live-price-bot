@@ -299,7 +299,7 @@ async def insert_prices_loop():
         await asyncio.sleep(5)
 
 
-     async def insert_price_batch(batch):
+    async def insert_price_batch(batch):
     for row in batch:
         symbol = row["symbol"]
         price = row["price"]
