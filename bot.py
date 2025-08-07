@@ -250,40 +250,39 @@ async def fetch_symbols_loop():
                 await session.close()
 
 async def insert_price(data):
-    global last_price_time
-    try:
-        price = data.get("price")
-        symbol = data.get("symbol")
-        ts = datetime.fromtimestamp(data["timestamp"], timezone.utc).isoformat()
-        status = "pulled" if price is not None else "failed"
+    async def receive_price(data):
+    global price_buffer, last_price_time
+    symbol = data.get("symbol")
+    price = data.get("price")
+    timestamp = data.get("timestamp")
 
-        if price is None:
-            price = 0
-            await log_error_with_deduplication(
-                error_type="price_insert",
-                severity="warning",
-                message=f"No price data received for symbol",
-                function_name="insert_price",
-                symbol=symbol,
-                active_symbols_count=len(symbols)
-            )
-        else:
-            print(f"✅ Price pulled for {symbol}: {price}")
-            last_price_time = datetime.now(timezone.utc)
+    ts = datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+    status = "pulled" if price is not None else "failed"
 
-        asset_info = symbol_map.get(symbol, {})
+    if price is None:
+        price = 0
+        print(f"❌ No price for {symbol}, inserting 0")
+    else:
+        print(f"✅ Price pulled for {symbol}: {price}")
+        last_price_time = datetime.now(timezone.utc)
 
-        row = {
-            "symbol": symbol,
-            "standardized_symbol": asset_info.get("standardized_symbol"),
-            "search_symbol": symbol.replace("/", "").upper(),
-            "asset_name": asset_info.get("asset_name"),
-            "market_type": asset_info.get("market_type"),
-            "exchange": asset_info.get("exchange"),
-            "price": price,
-            "status": status,
-            "updated_at": ts
-        }
+    matched = symbol_map.get(symbol)
+    if not matched:
+        print(f"⚠️ No match in symbol_map for {symbol}")
+        return
+
+    price_buffer[symbol] = {
+        "symbol": symbol,
+        "standardized_symbol": matched.get("standardized_symbol", symbol),
+        "price": price,
+        "updated_at": ts,
+        "name": matched.get("asset_name", symbol),
+        "market_type": matched.get("market_type", "unknown"),
+        "status": status,
+        "search_symbol": matched.get("standardized_symbol", symbol),
+        "exchange": matched.get("exchange", None)
+    }
+
 
         async with aiohttp.ClientSession() as session:
             try:
