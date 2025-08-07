@@ -249,7 +249,7 @@ async def fetch_symbols_loop():
             if session and not session.closed:
                 await session.close()
 
-    async def receive_price(data):
+async def receive_price(data):
     global price_buffer, last_price_time
 
     symbol = data.get("symbol")
