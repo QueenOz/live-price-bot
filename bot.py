@@ -258,6 +258,9 @@ async def receive_price(data):
     price = data.get("price")
     timestamp = data.get("timestamp")
 
+    # 🔍 DEBUG: Log all incoming symbols
+    print(f"🔍 INCOMING: symbol='{symbol}', price={price}")
+
     ts = datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
     status = "pulled" if price is not None else "failed"
 
@@ -270,7 +273,8 @@ async def receive_price(data):
 
     matched = symbol_map.get(symbol)
     if not matched:
-        print(f"⚠️ No match in symbol_map for {symbol}")
+        print(f"⚠️ No match in symbol_map for '{symbol}'")
+        print(f"🔍 Available symbols in map: {list(symbol_map.keys())}")
         return
 
     # 🚨 REAL MONEY: Build price data
@@ -473,6 +477,7 @@ async def maintain_connection():
                     })
                     await ws.send_str(subscribe_payload)
                     print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
+                    print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
                 else:
                     print("✅ Symbol list unchanged, skipping re-subscribe")
 
