@@ -531,6 +531,12 @@ async def maintain_connection():
                     print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
                     print(f"🔍 TWELVE DATA FORMAT: {twelvedata_symbols}")
                     print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
+                    
+                    # 🚨 Wait for subscription confirmation
+                    print("⏳ Waiting for subscription confirmation...")
+                    confirmation_timeout = 10
+                    start_time = asyncio.get_event_loop().time()
+                    
                 else:
                     print("✅ Symbol list unchanged, skipping re-subscribe")
 
