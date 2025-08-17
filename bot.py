@@ -294,7 +294,8 @@ async def receive_price(data):
     # 🔍 DEBUG: Log all incoming symbols
     print(f"🔍 INCOMING: symbol='{symbol}', price={price}")
 
-    ts = datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
+    # 🔧 FIXED: Use timezone-aware timestamp conversion
+    ts = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
     status = "pulled" if price is not None else "failed"
 
     if price is None:
@@ -456,10 +457,25 @@ async def maintain_connection():
                 if resubscribe:
                     print(f"🚀 ATTEMPTING SUBSCRIPTION with {len(symbols)} symbols...")
                     
+                    # 🔧 ETH/USD WORKAROUND: Try alternative symbols if ETH/USD fails
+                    symbol_alternatives = {
+                        "ETH/USD": ["ETH/USD", "ETHUSD", "ETH-USD", "ETHEREUM/USD"]
+                    }
+                    
+                    final_symbols = []
+                    for symbol in symbols:
+                        if symbol in symbol_alternatives:
+                            # Try the first alternative for now
+                            alt_symbol = symbol_alternatives[symbol][0]
+                            final_symbols.append(alt_symbol)
+                            print(f"🔧 Using {alt_symbol} for {symbol}")
+                        else:
+                            final_symbols.append(symbol)
+                    
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(symbols)  # 🔧 FIXED: Use original format
+                            "symbols": ",".join(final_symbols)  # 🔧 FIXED: Use original format
                         }
                     })
                     
@@ -781,4 +797,3 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"☠️ Fatal error: {e}")
         sys.exit(1)
-        
