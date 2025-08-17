@@ -703,7 +703,7 @@ async def watchdog():
             break
         except Exception as e:
             await log_error_with_deduplication(
-                error_type="startup",  # 🔧 FIXED: Use valid error type  
+                error_type="network",  # 🔧 FIXED: Use valid error type  
                 severity="error",
                 message=f"Watchdog error: {str(e)}",
                 function_name="watchdog",
