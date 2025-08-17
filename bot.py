@@ -203,6 +203,7 @@ async def fetch_symbols_loop():
                 symbol_map = new_map
                 consecutive_failures = 0  # Reset on success
                 print(f"🔄 Refreshed symbols: {len(symbols)} symbols loaded")
+                print(f"📋 Active symbols: {list(symbols)}")  # ✅ Show which symbols are loaded
                 
                 # Normal interval between successful fetches
                 await asyncio.sleep(60)
@@ -248,6 +249,7 @@ async def fetch_symbols_loop():
                 await session.close()
 
 async def receive_price(data):
+    """Process incoming price and buffer it for batch insertion"""
     global price_buffer, last_price_time
 
     symbol = data.get("symbol")
@@ -259,9 +261,9 @@ async def receive_price(data):
 
     if price is None:
         price = 0
-        print(f"❌ No price for {symbol}, inserting 0")
+        print(f"❌ No price for {symbol}, buffering 0")
     else:
-        print(f"✅ Price pulled for {symbol}: {price}")
+        print(f"✅ Price pulled for {symbol}: {price} - buffering for batch insert")
         last_price_time = datetime.now(timezone.utc)
 
     matched = symbol_map.get(symbol)
@@ -269,19 +271,23 @@ async def receive_price(data):
         print(f"⚠️ No match in symbol_map for {symbol}")
         return
 
+    # ✅ Buffer price for batch insertion
     price_buffer[symbol] = {
         "symbol": symbol,
         "standardized_symbol": matched.get("standardized_symbol", symbol),
         "price": price,
         "updated_at": ts,
-        "asset_name": matched.get("asset_name", symbol),  # ✅ Changed from "name" to "asset_name"
+        "asset_name": matched.get("asset_name", symbol),
         "market_type": matched.get("market_type", "unknown"),
         "status": status,
         "search_symbol": matched.get("standardized_symbol", symbol),
         "exchange": matched.get("exchange", None)
     }
+    
+    print(f"🔄 Buffered {symbol} price. Buffer now has {len(price_buffer)} symbols")
 
 async def insert_prices_loop():
+    """Batch insert loop - processes buffered prices every 15 seconds"""
     global price_buffer, last_insert_time
 
     while not shutdown_requested:
@@ -292,48 +298,100 @@ async def insert_prices_loop():
             batch = list(price_buffer.values())
             price_buffer.clear()
             last_insert_time = now
-            print(f"📤 Inserting batch of {len(batch)} prices")
+            print(f"📤 Processing batch of {len(batch)} prices for insertion")
             await insert_price_batch(batch)
         
         await asyncio.sleep(5)
 
 async def insert_price_batch(batch):
-    for row in batch:
-        symbol = row.get("symbol")
-        price = row.get("price")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{SUPABASE_URL}/functions/v1/insert-live-price",
-                    headers={
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"prices": [row]}
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        await log_error_with_deduplication(
-                            error_type="edge_insert",
-                            severity="error",
-                            message=f"Edge insert-live-price failed: HTTP {resp.status}",
-                            function_name="insert_price_batch",
-                            symbol=symbol,
-                            response_data={"error": error_text},
-                            request_data=row
-                        )
-                    else:
-                        print(f"✅ [Edge] Price inserted for {symbol}: {price}")
-        except Exception as e:
-            await log_error_with_deduplication(
-                error_type="edge_insert",
-                severity="error",
-                message=f"Edge insert-live-price exception: {str(e)}",
-                function_name="insert_price_batch",
-                symbol=symbol,
-                request_data=row,
-                stack_trace=traceback.format_exc()
-            )
+    """✅ FIXED: True batch insert - send ALL prices in a single request"""
+    if not batch:
+        return
+        
+    try:
+        print(f"📦 Sending batch of {len(batch)} prices to edge function...")
+        
+        # ✅ FIXED: Send entire batch in a single request
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{SUPABASE_URL}/functions/v1/insert-live-price",
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={"prices": batch}  # ✅ Send ALL prices at once
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    await log_error_with_deduplication(
+                        error_type="edge_insert",
+                        severity="error",
+                        message=f"Edge insert-live-price batch failed: HTTP {resp.status}",
+                        function_name="insert_price_batch",
+                        response_data={"error": error_text},
+                        request_data={"batch_size": len(batch)}
+                    )
+                else:
+                    response_data = await resp.json()
+                    symbols_inserted = [p.get("symbol") for p in batch]
+                    print(f"✅ [Edge] Successfully batch inserted {len(batch)} prices: {symbols_inserted}")
+                    print(f"📊 Server response: {response_data.get('count', 'unknown')} records affected")
+                    
+    except Exception as e:
+        await log_error_with_deduplication(
+            error_type="edge_insert",
+            severity="error",
+            message=f"Edge insert-live-price batch exception: {str(e)}",
+            function_name="insert_price_batch",
+            request_data={"batch_size": len(batch)},
+            stack_trace=traceback.format_exc()
+        )
+
+# ✅ ALTERNATIVE: Direct Supabase batch insert (faster)
+async def insert_price_batch_direct(batch):
+    """Direct Supabase batch insert - bypasses edge function"""
+    if not batch:
+        return
+        
+    try:
+        print(f"📦 Direct batch inserting {len(batch)} prices to Supabase...")
+        
+        # Transform to match live_prices table schema
+        rows = []
+        for p in batch:
+            rows.append({
+                "symbol": p["symbol"],
+                "standardized_symbol": p["standardized_symbol"],
+                "search_symbol": p["search_symbol"], 
+                "name": p["asset_name"],
+                "market_type": p["market_type"],
+                "exchange": p["exchange"],
+                "price": p["price"],
+                "status": p["status"],
+                "updated_at": p["updated_at"]
+            })
+        
+        # ✅ Single batch upsert
+        result = supabase.table("live_prices").upsert(
+            rows,
+            on_conflict="symbol"
+        ).execute()
+        
+        if result.data:
+            symbols_inserted = [p["symbol"] for p in batch]
+            print(f"✅ [Direct] Successfully batch inserted {len(batch)} prices: {symbols_inserted}")
+        else:
+            print(f"⚠️ Direct insert returned no data for batch of {len(batch)}")
+            
+    except Exception as e:
+        await log_error_with_deduplication(
+            error_type="direct_insert",
+            severity="error",
+            message=f"Direct Supabase batch insert exception: {str(e)}",
+            function_name="insert_price_batch_direct",
+            request_data={"batch_size": len(batch)},
+            stack_trace=traceback.format_exc()
+        )
 
 async def send_heartbeat(ws):
     while not shutdown_requested:
@@ -361,7 +419,7 @@ async def check_price_timeout():
             await asyncio.sleep(5)
             now = datetime.now(timezone.utc)
             delta = (now - last_price_time).total_seconds()
-            if delta > 30:  # Increased timeout to 30 seconds
+            if delta > 60:  # ✅ Increased timeout to 60 seconds for batch processing
                 await log_error_with_deduplication(
                     error_type="timeout",
                     severity="warning",
@@ -413,7 +471,7 @@ async def maintain_connection():
                         }
                     })
                     await ws.send_str(subscribe_payload)
-                    print(f"📤 Subscribed to: {len(symbols)} symbols")
+                    print(f"📤 Subscribed to: {len(symbols)} symbols ({list(symbols)})")
                 else:
                     print("✅ Symbol list unchanged, skipping re-subscribe")
 
@@ -428,7 +486,7 @@ async def maintain_connection():
                         try:
                             data = json.loads(msg.data)
                             if data.get("event") == "price":
-                                await receive_price(data)  # ✅ Fixed: Call receive_price instead of insert_price
+                                await receive_price(data)
                             elif data.get("event") == "status":
                                 print(f"⚙️ Status event: {data}")
                             else:
@@ -572,7 +630,7 @@ async def watchdog():
                 )
                 print(f"💔 Health check failed - no prices for {int(time_since_price)}s")
             else:
-                print("💚 Health check passed")
+                print(f"💚 Health check passed - last price {int(time_since_price)}s ago, buffer has {len(price_buffer)} symbols")
             
         except asyncio.CancelledError:
             print("🛑 Watchdog cancelled")
@@ -623,7 +681,7 @@ async def main():
     """Enhanced main with task supervision and auto-restart"""
     global fetch_task, connection_task, watchdog_task, shutdown_requested
     restart_count = 0
-    max_restarts = 999999  # ✅ CHANGED FROM 10 TO 999999 - THAT'S IT!
+    max_restarts = 999999
     
     # Set up signal handlers
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -631,12 +689,12 @@ async def main():
     
     while restart_count < max_restarts and not shutdown_requested:
         try:
-            print(f"🚀 Starting enhanced trading bot (restart #{restart_count})...")
+            print(f"🚀 Starting enhanced trading bot with BATCH processing (restart #{restart_count})...")
             
             await log_error_with_deduplication(
                 error_type="startup",
                 severity="info",
-                message=f"Trading bot started (restart #{restart_count})",
+                message=f"Trading bot started with batch processing (restart #{restart_count})",
                 function_name="main",
                 active_symbols_count=0
             )
@@ -644,8 +702,14 @@ async def main():
             # Start all core tasks
             fetch_task = asyncio.create_task(fetch_symbols_loop())
             connection_task = asyncio.create_task(maintain_connection())
-            insert_task = asyncio.create_task(insert_prices_loop())  # ✅ Added missing insert_prices_loop task
+            insert_task = asyncio.create_task(insert_prices_loop())
             watchdog_task = asyncio.create_task(watchdog())
+            
+            print("✅ All tasks started:")
+            print("  📡 fetch_symbols_loop - Gets active game symbols")
+            print("  🔗 maintain_connection - WebSocket price streaming")
+            print("  📦 insert_prices_loop - Batch price insertion every 15s")
+            print("  🐕 watchdog - Task monitoring and restart")
             
             # Wait for any task to complete (which shouldn't happen unless shutdown)
             done, pending = await asyncio.wait(
