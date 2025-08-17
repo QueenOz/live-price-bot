@@ -657,7 +657,7 @@ async def watchdog():
                 exception = fetch_task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="task_failure",
+                        error_type="startup",  # 🔧 FIXED: Use valid error type
                         severity="critical",
                         message=f"fetch_symbols_loop task died: {str(exception)}",
                         function_name="watchdog",
@@ -672,7 +672,7 @@ async def watchdog():
                 exception = connection_task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="task_failure",
+                        error_type="connection",  # 🔧 FIXED: Use valid error type
                         severity="critical",
                         message=f"maintain_connection task died: {str(exception)}",
                         function_name="watchdog",
@@ -688,7 +688,7 @@ async def watchdog():
             
             if time_since_price > 60:  # 🚀 REDUCED: 1 minute for real-time
                 await log_error_with_deduplication(
-                    error_type="health_check",
+                    error_type="timeout",  # 🔧 FIXED: Use valid error type
                     severity="critical",
                     message=f"No price updates for {int(time_since_price)} seconds - system may be stalled",
                     function_name="watchdog",
@@ -703,7 +703,7 @@ async def watchdog():
             break
         except Exception as e:
             await log_error_with_deduplication(
-                error_type="watchdog",
+                error_type="startup",  # 🔧 FIXED: Use valid error type  
                 severity="error",
                 message=f"Watchdog error: {str(e)}",
                 function_name="watchdog",
@@ -796,7 +796,7 @@ async def main():
                 exception = task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="task_crash",
+                        error_type="startup",  # 🔧 FIXED: Use valid error type
                         severity="fatal",
                         message=f"Core task crashed: {str(exception)}",
                         function_name="main",
@@ -817,7 +817,7 @@ async def main():
         except Exception as e:
             restart_count += 1
             await log_error_with_deduplication(
-                error_type="main_crash",
+                error_type="startup",  # 🔧 FIXED: Use valid error type
                 severity="fatal",
                 message=f"Main function crashed: {str(e)}",
                 function_name="main",
