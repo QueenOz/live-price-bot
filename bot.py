@@ -144,9 +144,10 @@ async def fetch_symbols_loop():
         try:
             # Create fresh session for each attempt after failure
             session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30, connect=10)
+                timeout=aiohttp.ClientTimeout(total=60, connect=20)  # 🔧 Increased timeouts
             )
             
+            print(f"📡 Fetching symbols from {FETCH_SYMBOLS_ENDPOINT}...")
             async with session.post(
                 FETCH_SYMBOLS_ENDPOINT,
                 headers={
@@ -159,6 +160,7 @@ async def fetch_symbols_loop():
                 if not response.ok:
                     error_text = await response.text()
                     consecutive_failures += 1
+                    print(f"❌ fetch-symbols API error: HTTP {response.status} - {error_text}")
                     await log_error_with_deduplication(
                         error_type="api",
                         severity="error",
@@ -173,6 +175,10 @@ async def fetch_symbols_loop():
                 
                 data = await response.json()
                 fetched_symbols = data.get("symbols", [])
+                
+                print(f"🔍 RAW RESPONSE: Found {len(fetched_symbols)} symbols from view")
+                if fetched_symbols:
+                    print(f"📋 First few symbols: {[s.get('symbol') for s in fetched_symbols[:5]]}")
                 
                 # ✅ Check if no symbols returned - clear live_prices table
                 if not fetched_symbols:
@@ -189,8 +195,10 @@ async def fetch_symbols_loop():
                 for row in fetched_symbols:
                     symbol_str = row.get("symbol")
                     if not symbol_str:
+                        print(f"⚠️ Skipping row with missing symbol: {row}")
                         continue  # skip empty
 
+                    print(f"🔧 PROCESSING: {symbol_str}")
                     new_symbols.add(symbol_str)
                     new_map[symbol_str] = {
                         "market_id": row.get("market_id"),
@@ -203,9 +211,19 @@ async def fetch_symbols_loop():
 
                 symbols = new_symbols
                 symbol_map = new_map
+                
                 consecutive_failures = 0  # Reset on success
-                print(f"🔄 Refreshed symbols: {len(symbols)} symbols loaded")
-                print(f"📋 Active symbols: {list(symbols)}")  # ✅ Show which symbols are loaded
+                print(f"✅ SUCCESS: Loaded {len(symbols)} symbols from game_assets_view")
+                print(f"📋 ALL SYMBOLS: {sorted(list(symbols))}")  # Show all symbols alphabetically
+                print(f"🗺️ Symbol map has {len(symbol_map)} entries")
+                
+                # 🔍 Debug specific symbols
+                if "BTC/USD" in symbol_map:
+                    print(f"✅ BTC/USD found: {symbol_map['BTC/USD']}")
+                if "ETH/USD" in symbol_map:
+                    print(f"✅ ETH/USD found: {symbol_map['ETH/USD']}")
+                else:
+                    print("❌ ETH/USD NOT found in symbol_map")
                 
                 # Normal interval between successful fetches
                 await asyncio.sleep(60)
@@ -213,8 +231,21 @@ async def fetch_symbols_loop():
         except asyncio.CancelledError:
             print("🛑 fetch_symbols_loop cancelled")
             break
+        except asyncio.TimeoutError as e:
+            consecutive_failures += 1
+            print(f"⏰ TIMEOUT: fetch_symbols_loop timed out (attempt {consecutive_failures})")
+            await log_error_with_deduplication(
+                error_type="timeout",
+                severity="error",
+                message=f"fetch_symbols_loop timeout: {str(e)}",
+                function_name="fetch_symbols_loop",
+                stack_trace=traceback.format_exc(),
+                active_symbols_count=len(symbols)
+            )
+            await exponential_backoff(consecutive_failures, base_delay=5)
         except aiohttp.ClientError as e:
             consecutive_failures += 1
+            print(f"🌐 HTTP CLIENT ERROR: {str(e)}")
             await log_error_with_deduplication(
                 error_type="api",
                 severity="error",
@@ -226,6 +257,7 @@ async def fetch_symbols_loop():
             await exponential_backoff(consecutive_failures, base_delay=5)
         except json.JSONDecodeError as e:
             consecutive_failures += 1
+            print(f"📄 JSON PARSE ERROR: {str(e)}")
             await log_error_with_deduplication(
                 error_type="parsing",
                 severity="error",
@@ -237,6 +269,7 @@ async def fetch_symbols_loop():
             await exponential_backoff(consecutive_failures, base_delay=5)
         except Exception as e:
             consecutive_failures += 1
+            print(f"💥 UNEXPECTED ERROR: {str(e)}")
             await log_error_with_deduplication(
                 error_type="symbol_fetch",
                 severity="error",
@@ -258,8 +291,16 @@ async def receive_price(data):
     price = data.get("price")
     timestamp = data.get("timestamp")
 
+    # 🔧 SYMBOL FORMAT FIX: Convert Twelve Data format back to database format
+    original_symbol = symbol
+    if '-' in symbol and symbol not in symbol_map:
+        # Convert ETH-USD back to ETH/USD for database lookup
+        database_symbol = symbol.replace('-', '/')
+        print(f"🔧 REVERSE CONVERSION: {symbol} → {database_symbol}")
+        symbol = database_symbol
+
     # 🔍 DEBUG: Log all incoming symbols
-    print(f"🔍 INCOMING: symbol='{symbol}', price={price}")
+    print(f"🔍 INCOMING: original='{original_symbol}', converted='{symbol}', price={price}")
 
     ts = datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
     status = "pulled" if price is not None else "failed"
@@ -279,7 +320,7 @@ async def receive_price(data):
 
     # 🚨 REAL MONEY: Build price data
     price_data = {
-        "symbol": symbol,
+        "symbol": symbol,  # Use database format (ETH/USD)
         "standardized_symbol": matched.get("standardized_symbol", symbol),
         "price": price,
         "updated_at": ts,
@@ -468,15 +509,27 @@ async def maintain_connection():
                 consecutive_failures = 0  # Reset on successful connection
                 
                 if resubscribe:
+                    # 🔧 SYMBOL FORMAT FIX: Convert slashes to dashes for Twelve Data
+                    twelvedata_symbols = []
+                    for symbol in symbols:
+                        if '/' in symbol:
+                            # Convert ETH/USD to ETH-USD for Twelve Data
+                            td_symbol = symbol.replace('/', '-')
+                            twelvedata_symbols.append(td_symbol)
+                            print(f"🔧 SYMBOL CONVERSION: {symbol} → {td_symbol}")
+                        else:
+                            twelvedata_symbols.append(symbol)
+                    
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(symbols),
+                            "symbols": ",".join(twelvedata_symbols),
                             "apikey": TWELVE_DATA_API_KEY
                         }
                     })
                     await ws.send_str(subscribe_payload)
                     print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
+                    print(f"🔍 TWELVE DATA FORMAT: {twelvedata_symbols}")
                     print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
                 else:
                     print("✅ Symbol list unchanged, skipping re-subscribe")
