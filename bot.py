@@ -21,7 +21,8 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-TD_WEBSOCKET_URL = os.getenv("TD_WEBSOCKET_URL") + f"?apikey={TWELVE_DATA_API_KEY}"
+# 🔧 FIXED: Use correct WebSocket URL from documentation
+TD_WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -493,6 +494,7 @@ async def maintain_connection():
                 await asyncio.sleep(5)
                 continue
 
+            print(f"🔍 SYMBOLS CHECK: {len(symbols)} symbols available: {list(symbols)}")
             resubscribe = symbols != previous_symbols
             previous_symbols = set(symbols)
 
@@ -502,40 +504,31 @@ async def maintain_connection():
             )
 
             print(f"🔗 Connecting to WebSocket... (failures: {consecutive_failures})")
+            print(f"🔗 WebSocket URL: {TD_WEBSOCKET_URL}")
             async with session.ws_connect(
                 TD_WEBSOCKET_URL,
                 heartbeat=30
             ) as ws:
+                print("✅ WebSocket connected successfully!")
                 consecutive_failures = 0  # Reset on successful connection
                 
                 if resubscribe:
-                    # 🔧 SYMBOL FORMAT FIX: Convert slashes to dashes for Twelve Data
-                    twelvedata_symbols = []
-                    for symbol in symbols:
-                        if '/' in symbol:
-                            # Convert ETH/USD to ETH-USD for Twelve Data
-                            td_symbol = symbol.replace('/', '-')
-                            twelvedata_symbols.append(td_symbol)
-                            print(f"🔧 SYMBOL CONVERSION: {symbol} → {td_symbol}")
-                        else:
-                            twelvedata_symbols.append(symbol)
+                    print(f"🚀 ATTEMPTING SUBSCRIPTION with {len(symbols)} symbols...")
                     
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(twelvedata_symbols),
-                            "apikey": TWELVE_DATA_API_KEY
+                            "symbols": ",".join(symbols)  # 🔧 FIXED: Use original format, not converted
                         }
                     })
+                    
+                    print(f"📤 SENDING SUBSCRIPTION...")
                     await ws.send_str(subscribe_payload)
                     print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
-                    print(f"🔍 TWELVE DATA FORMAT: {twelvedata_symbols}")
                     print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
                     
                     # 🚨 Wait for subscription confirmation
                     print("⏳ Waiting for subscription confirmation...")
-                    confirmation_timeout = 10
-                    start_time = asyncio.get_event_loop().time()
                     
                 else:
                     print("✅ Symbol list unchanged, skipping re-subscribe")
