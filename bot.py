@@ -14,7 +14,6 @@ import random
 price_buffer = {}
 last_insert_time = datetime.now(timezone.utc)
 IMMEDIATE_INSERT = True  # 🚨 REAL MONEY MODE: Insert every price immediately
-BATCH_INTERVAL = timedelta(seconds=0.5)  # Fallback only
 
 # Load env vars
 load_dotenv()
@@ -292,16 +291,8 @@ async def receive_price(data):
     price = data.get("price")
     timestamp = data.get("timestamp")
 
-    # 🔧 SYMBOL FORMAT FIX: Convert Twelve Data format back to database format
-    original_symbol = symbol
-    if '-' in symbol and symbol not in symbol_map:
-        # Convert ETH-USD back to ETH/USD for database lookup
-        database_symbol = symbol.replace('-', '/')
-        print(f"🔧 REVERSE CONVERSION: {symbol} → {database_symbol}")
-        symbol = database_symbol
-
     # 🔍 DEBUG: Log all incoming symbols
-    print(f"🔍 INCOMING: original='{original_symbol}', converted='{symbol}', price={price}")
+    print(f"🔍 INCOMING: symbol='{symbol}', price={price}")
 
     ts = datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
     status = "pulled" if price is not None else "failed"
@@ -321,7 +312,7 @@ async def receive_price(data):
 
     # 🚨 REAL MONEY: Build price data
     price_data = {
-        "symbol": symbol,  # Use database format (ETH/USD)
+        "symbol": symbol,
         "standardized_symbol": matched.get("standardized_symbol", symbol),
         "price": price,
         "updated_at": ts,
@@ -374,7 +365,7 @@ async def insert_single_price_immediate(price_data):
             
     except Exception as e:
         await log_error_with_deduplication(
-            error_type="immediate_insert",
+            error_type="database",
             severity="error",
             message=f"IMMEDIATE insert failed for {price_data.get('symbol', 'unknown')}: {str(e)}",
             function_name="insert_single_price_immediate",
@@ -389,56 +380,6 @@ async def insert_prices_loop():
         # Just monitor system health
         await asyncio.sleep(5)
         print(f"💰 REAL MONEY MODE: Active - all prices inserted immediately")
-
-# 🚀 OPTIMIZED: Direct Supabase insert for maximum speed
-async def insert_price_batch_direct(batch):
-    """⚡ DIRECT SUPABASE: Fastest possible batch insert"""
-    if not batch:
-        return
-        
-    try:
-        symbols_list = [p["symbol"] for p in batch]
-        print(f"🚀 DIRECT INSERT: {len(batch)} prices [{', '.join(symbols_list)}]")
-        
-        # Transform to match live_prices table schema
-        rows = []
-        for p in batch:
-            rows.append({
-                "symbol": p["symbol"],
-                "standardized_symbol": p["standardized_symbol"],
-                "search_symbol": p["search_symbol"], 
-                "name": p["asset_name"],
-                "market_type": p["market_type"],
-                "exchange": p["exchange"],
-                "price": p["price"],
-                "status": p["status"],
-                "updated_at": p["updated_at"]
-            })
-        
-        # ✅ FASTEST: Single direct batch upsert
-        start_time = datetime.now()
-        result = supabase.table("live_prices").upsert(
-            rows,
-            on_conflict="symbol"
-        ).execute()
-        end_time = datetime.now()
-        
-        duration_ms = (end_time - start_time).total_seconds() * 1000
-        
-        if result.data:
-            print(f"✅ INSERTED {len(batch)} prices in {duration_ms:.0f}ms: {symbols_list}")
-        else:
-            print(f"⚠️ Direct insert returned no data for batch of {len(batch)}")
-            
-    except Exception as e:
-        await log_error_with_deduplication(
-            error_type="direct_insert",
-            severity="error",
-            message=f"Direct Supabase batch insert exception: {str(e)}",
-            function_name="insert_price_batch_direct",
-            request_data={"batch_size": len(batch)},
-            stack_trace=traceback.format_exc()
-        )
 
 async def send_heartbeat(ws):
     while not shutdown_requested:
@@ -518,7 +459,7 @@ async def maintain_connection():
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(symbols)  # 🔧 FIXED: Use original format, not converted
+                            "symbols": ",".join(symbols)  # 🔧 FIXED: Use original format
                         }
                     })
                     
@@ -543,11 +484,19 @@ async def maintain_connection():
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
+                            # 🔍 DEBUG: Log ALL WebSocket messages
+                            print(f"🔍 RAW WEBSOCKET: {data}")
+                            
                             if data.get("event") == "price":
-                                # 🚀 CRITICAL: Process price immediately
+                                # 🚨 CRITICAL: Process price immediately
+                                print(f"💰 PRICE EVENT RECEIVED: {data}")
                                 await receive_price(data)
                             elif data.get("event") == "status":
                                 print(f"⚙️ Status event: {data}")
+                            elif data.get("event") == "subscribe-status":
+                                print(f"📋 SUBSCRIPTION STATUS: {data}")
+                            elif data.get("event") == "heartbeat":
+                                print(f"💓 Heartbeat: {data.get('status', 'unknown')}")
                             else:
                                 print(f"🪵 Other event: {data}")
                         except json.JSONDecodeError as e:
@@ -650,7 +599,7 @@ async def watchdog():
                 exception = fetch_task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="startup",  # 🔧 FIXED: Use valid error type
+                        error_type="startup",
                         severity="critical",
                         message=f"fetch_symbols_loop task died: {str(exception)}",
                         function_name="watchdog",
@@ -665,7 +614,7 @@ async def watchdog():
                 exception = connection_task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="connection",  # 🔧 FIXED: Use valid error type
+                        error_type="connection",
                         severity="critical",
                         message=f"maintain_connection task died: {str(exception)}",
                         function_name="watchdog",
@@ -681,7 +630,7 @@ async def watchdog():
             
             if time_since_price > 60:  # 🚀 REDUCED: 1 minute for real-time
                 await log_error_with_deduplication(
-                    error_type="timeout",  # 🔧 FIXED: Use valid error type
+                    error_type="timeout",
                     severity="critical",
                     message=f"No price updates for {int(time_since_price)} seconds - system may be stalled",
                     function_name="watchdog",
@@ -696,7 +645,7 @@ async def watchdog():
             break
         except Exception as e:
             await log_error_with_deduplication(
-                error_type="network",  # 🔧 FIXED: Use valid error type  
+                error_type="network",
                 severity="error",
                 message=f"Watchdog error: {str(e)}",
                 function_name="watchdog",
@@ -714,7 +663,7 @@ async def graceful_shutdown():
     global fetch_task, connection_task, watchdog_task
     print("🛑 Shutting down gracefully...")
     
-    # 🚨 REAL MONEY: Make sure we don't lose any prices
+    # 🚨 REAL MONEY: No buffered prices to flush - all inserted immediately
     print("🚨 REAL MONEY MODE: No buffered prices to flush - all inserted immediately")
     
     tasks_to_cancel = []
@@ -752,7 +701,7 @@ async def main():
     while restart_count < max_restarts and not shutdown_requested:
         try:
             print(f"🚨 REAL MONEY MODE: IMMEDIATE insertion - every price matters!")
-            print(f"💰 ZERO DELAYS: AAPL, MSFT, GOOGL inserted instantly on every update")
+            print(f"💰 ZERO DELAYS: All symbols inserted instantly on every update")
             
             await log_error_with_deduplication(
                 error_type="startup",
@@ -789,7 +738,7 @@ async def main():
                 exception = task.exception()
                 if exception:
                     await log_error_with_deduplication(
-                        error_type="startup",  # 🔧 FIXED: Use valid error type
+                        error_type="startup",
                         severity="fatal",
                         message=f"Core task crashed: {str(exception)}",
                         function_name="main",
@@ -810,7 +759,7 @@ async def main():
         except Exception as e:
             restart_count += 1
             await log_error_with_deduplication(
-                error_type="startup",  # 🔧 FIXED: Use valid error type
+                error_type="startup",
                 severity="fatal",
                 message=f"Main function crashed: {str(e)}",
                 function_name="main",
