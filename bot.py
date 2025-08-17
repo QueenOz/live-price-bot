@@ -292,10 +292,25 @@ async def receive_price(data):
     timestamp = data.get("timestamp")
 
     # 🔍 DEBUG: Log all incoming symbols
-    print(f"🔍 INCOMING: symbol='{symbol}', price={price}")
+    print(f"🔍 INCOMING: symbol='{symbol}', price={price}, timestamp={timestamp}")
 
-    # 🔧 FIXED: Use timezone-aware timestamp conversion
-    ts = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    # 🔧 TIMESTAMP FIX: Use current time if WebSocket timestamp is invalid
+    try:
+        # Check if timestamp is reasonable (not too far in future/past)
+        ws_time = datetime.fromtimestamp(timestamp, timezone.utc)
+        current_time = datetime.now(timezone.utc)
+        time_diff = abs((ws_time - current_time).total_seconds())
+        
+        if time_diff > 3600:  # More than 1 hour difference
+            print(f"⚠️ Invalid timestamp {timestamp} ({ws_time}), using current time")
+            ts = current_time.isoformat()
+        else:
+            ts = ws_time.isoformat()
+            
+    except (ValueError, OSError):
+        print(f"⚠️ Failed to parse timestamp {timestamp}, using current time")
+        ts = datetime.now(timezone.utc).isoformat()
+        
     status = "pulled" if price is not None else "failed"
 
     if price is None:
@@ -459,16 +474,16 @@ async def maintain_connection():
                     
                     # 🔧 ETH/USD WORKAROUND: Try alternative symbols if ETH/USD fails
                     symbol_alternatives = {
-                        "ETH/USD": ["ETH/USD", "ETHUSD", "ETH-USD", "ETHEREUM/USD"]
+                        "ETH/USD": ["ETHUSD", "ETH-USD", "ETHEREUM/USD", "ETH/USDT"]
                     }
                     
                     final_symbols = []
                     for symbol in symbols:
-                        if symbol in symbol_alternatives:
-                            # Try the first alternative for now
-                            alt_symbol = symbol_alternatives[symbol][0]
-                            final_symbols.append(alt_symbol)
-                            print(f"🔧 Using {alt_symbol} for {symbol}")
+                        if symbol == "ETH/USD":
+                            # Try alternatives for ETH/USD since it fails
+                            for alt in symbol_alternatives["ETH/USD"]:
+                                final_symbols.append(alt)
+                                print(f"🔧 Adding ETH alternative: {alt}")
                         else:
                             final_symbols.append(symbol)
                     
