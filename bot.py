@@ -32,6 +32,7 @@ symbol_map = {}
 previous_symbols = set()
 last_price_time = datetime.now(timezone.utc)
 shutdown_requested = False
+ws_to_db_map = {}  # 🔧 NEW: WebSocket to database symbol mapping
 
 # Task monitoring
 fetch_task = None
@@ -284,15 +285,18 @@ async def fetch_symbols_loop():
                 await session.close()
 
 async def receive_price(data):
-    """🚨 REAL MONEY MODE: IMMEDIATE insertion - every price matters"""
+    """🚨 REAL MONEY MODE: IMMEDIATE insertion - consistent symbol handling"""
     global last_price_time
 
-    symbol = data.get("symbol")
+    symbol = data.get("symbol")  # Use exactly what WebSocket sends
     price = data.get("price")
     timestamp = data.get("timestamp")
 
     # 🔍 DEBUG: Log all incoming symbols
     print(f"🔍 INCOMING: symbol='{symbol}', price={price}, timestamp={timestamp}")
+
+    # 🔧 CONSISTENT: No symbol mapping needed - use exact match
+    # Both BTC/USD and ETH/USD should come through as-is from TwelveData
 
     # 🔧 TIMESTAMP FIX: Use current time if WebSocket timestamp is invalid
     try:
@@ -320,15 +324,17 @@ async def receive_price(data):
         print(f"💰 REAL MONEY: {symbol}: ${price} - INSERTING NOW!")
         last_price_time = datetime.now(timezone.utc)
 
+    # Look up using exact symbol (should work for both BTC/USD and ETH/USD)
     matched = symbol_map.get(symbol)
     if not matched:
-        print(f"⚠️ No match in symbol_map for '{symbol}'")
+        print(f"❌ No match in symbol_map for symbol '{symbol}'")
         print(f"🔍 Available symbols in map: {list(symbol_map.keys())}")
+        print(f"🔍 This suggests TwelveData may be returning a different format than expected")
         return
 
-    # 🚨 REAL MONEY: Build price data
+    # 🚨 REAL MONEY: Build price data using exact symbol
     price_data = {
-        "symbol": symbol,
+        "symbol": symbol,  # Use exact symbol from WebSocket/database
         "standardized_symbol": matched.get("standardized_symbol", symbol),
         "price": price,
         "updated_at": ts,
@@ -437,8 +443,8 @@ async def check_price_timeout():
             break
 
 async def maintain_connection():
-    """Enhanced connection with exponential backoff and never-give-up attitude"""
-    global previous_symbols, shutdown_requested
+    """🔧 FIXED: Enhanced connection - no symbol editing, use exact database format"""
+    global previous_symbols, shutdown_requested, ws_to_db_map
     consecutive_failures = 0
     heartbeat_task = None
     timeout_task = None
@@ -472,32 +478,27 @@ async def maintain_connection():
                 if resubscribe:
                     print(f"🚀 ATTEMPTING SUBSCRIPTION with {len(symbols)} symbols...")
                     
-                    # 🔧 ETH/USD WORKAROUND: Try alternative symbols if ETH/USD fails
-                    symbol_alternatives = {
-                        "ETH/USD": ["ETHUSD", "ETH-USD", "ETHEREUM/USD", "ETH/USDT"]
-                    }
+                    # 🔧 CONSISTENT: Use all symbols exactly as they come from database
+                    final_symbols = list(symbols)  # No symbol modification at all
+                    ws_to_db_map = {}  # Reset mapping
                     
-                    final_symbols = []
+                    # Simple 1:1 mapping - no symbol transformation
                     for symbol in symbols:
-                        if symbol == "ETH/USD":
-                            # Try alternatives for ETH/USD since it fails
-                            for alt in symbol_alternatives["ETH/USD"]:
-                                final_symbols.append(alt)
-                                print(f"🔧 Adding ETH alternative: {alt}")
-                        else:
-                            final_symbols.append(symbol)
+                        ws_to_db_map[symbol] = symbol
+                        print(f"🔧 Direct mapping: '{symbol}' -> '{symbol}'")
                     
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(final_symbols)  # 🔧 FIXED: Use original format
+                            "symbols": ",".join(final_symbols)  # e.g., "BTC/USD,ETH/USD"
                         }
                     })
                     
                     print(f"📤 SENDING SUBSCRIPTION...")
                     await ws.send_str(subscribe_payload)
-                    print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
+                    print(f"📤 🚀 CONSISTENT SUBSCRIPTION: {final_symbols}")
                     print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
+                    print(f"🗺️ All symbols use database format - no modifications")
                     
                     # 🚨 Wait for subscription confirmation
                     print("⏳ Waiting for subscription confirmation...")
@@ -526,6 +527,13 @@ async def maintain_connection():
                                 print(f"⚙️ Status event: {data}")
                             elif data.get("event") == "subscribe-status":
                                 print(f"📋 SUBSCRIPTION STATUS: {data}")
+                                # Log subscription status for debugging
+                                if data.get("status") == "ok":
+                                    subscribed_symbol = data.get("symbol")
+                                    print(f"✅ Successfully subscribed to: {subscribed_symbol}")
+                                else:
+                                    failed_symbol = data.get("symbol")
+                                    print(f"❌ Subscription failed for: {failed_symbol} - {data}")
                             elif data.get("event") == "heartbeat":
                                 print(f"💓 Heartbeat: {data.get('status', 'unknown')}")
                             else:
@@ -733,11 +741,12 @@ async def main():
         try:
             print(f"🚨 REAL MONEY MODE: IMMEDIATE insertion - every price matters!")
             print(f"💰 ZERO DELAYS: All symbols inserted instantly on every update")
+            print(f"🔧 CONSISTENT: All symbols use exact database format - no modifications")
             
             await log_error_with_deduplication(
                 error_type="startup",
                 severity="info",
-                message=f"REAL-TIME trading bot started (restart #{restart_count})",
+                message=f"REAL-TIME trading bot started (restart #{restart_count}) - consistent symbol handling",
                 function_name="main",
                 active_symbols_count=0
             )
@@ -750,7 +759,7 @@ async def main():
             
             print("✅ REAL MONEY MODE tasks started:")
             print("  📡 fetch_symbols_loop - Gets active symbols")
-            print("  🔗 maintain_connection - WebSocket price streaming")
+            print("  🔗 maintain_connection - WebSocket price streaming (consistent formatting)")
             print(f"  💰 insert_prices_loop - IMMEDIATE insertion on every price update")
             print("  🐕 watchdog - Task monitoring and restart")
             
