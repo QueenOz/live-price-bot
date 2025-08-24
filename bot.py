@@ -24,6 +24,9 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 TD_WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
+# 🔧 NEW: Binance WebSocket for ETH/USD (free, no API key needed)
+BINANCE_WEBSOCKET_URL = "wss://stream.binance.com:9443/ws/ethusdt@ticker"
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Shared state with shutdown control
@@ -36,6 +39,7 @@ shutdown_requested = False
 # Task monitoring
 fetch_task = None
 connection_task = None
+binance_connection_task = None  # 🔧 NEW: Binance connection task
 watchdog_task = None
 
 async def exponential_backoff(attempt, base_delay=1, max_delay=60):
@@ -144,6 +148,317 @@ async def fetch_symbols_loop():
         try:
             # Create fresh session for each attempt after failure
             session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60, connect=15)
+            )
+            
+            print(f"🔗 Connecting to Binance WebSocket... (failures: {consecutive_failures})")
+            print(f"🔗 Binance URL: {BINANCE_WEBSOCKET_URL}")
+            async with session.ws_connect(BINANCE_WEBSOCKET_URL) as ws:
+                print("✅ Binance WebSocket connected for ETH/USD!")
+                consecutive_failures = 0  # Reset on successful connection
+                
+                async for msg in ws:
+                    if shutdown_requested:
+                        break
+                        
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                            print(f"🔍 RAW BINANCE WEBSOCKET: {data}")
+                            
+                            # Binance ticker format: {"s":"ETHUSDT","c":"4791.99",...}
+                            if data.get("s") == "ETHUSDT":
+                                print(f"💰 BINANCE PRICE EVENT: {data}")
+                                await receive_binance_price(data)
+                                
+                        except json.JSONDecodeError as e:
+                            await log_error_with_deduplication(
+                                error_type="parsing",
+                                severity="warning",
+                                message=f"Error parsing Binance WebSocket message: {str(e)}",
+                                function_name="maintain_binance_connection",
+                                connection_state="connected",
+                                response_data={"raw_message": msg.data}
+                            )
+                        except Exception as e:
+                            await log_error_with_deduplication(
+                                error_type="websocket",
+                                severity="error",
+                                message=f"Error processing Binance WebSocket message: {str(e)}",
+                                function_name="maintain_binance_connection",
+                                connection_state="connected",
+                                stack_trace=traceback.format_exc()
+                            )
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        await log_error_with_deduplication(
+                            error_type="websocket",
+                            severity="error",
+                            message=f"Binance WebSocket error: {msg.data}",
+                            function_name="maintain_binance_connection",
+                            connection_state="error",
+                            response_data={"error_data": str(msg.data)}
+                        )
+                        break
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        print("🔌 Binance WebSocket closed by server")
+                        break
+                        
+        except asyncio.CancelledError:
+            print("🛑 Binance maintain_connection cancelled")
+            break
+        except aiohttp.ClientError as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="connection",
+                severity="error",
+                message=f"Binance WebSocket connection error: {str(e)}",
+                function_name="maintain_binance_connection",
+                connection_state="failed",
+                stack_trace=traceback.format_exc()
+            )
+        except Exception as e:
+            consecutive_failures += 1
+            await log_error_with_deduplication(
+                error_type="connection",
+                severity="error",
+                message=f"Unexpected error in Binance maintain_connection: {str(e)}",
+                function_name="maintain_binance_connection",
+                connection_state="failed",
+                stack_trace=traceback.format_exc()
+            )
+        finally:
+            # Clean up session
+            if session and not session.closed:
+                await session.close()
+            
+            # Exponential backoff before reconnecting (only if there were failures)
+            if consecutive_failures > 0 and not shutdown_requested:
+                await exponential_backoff(consecutive_failures, base_delay=3, max_delay=30)
+            else:
+                await asyncio.sleep(1)  # Brief pause on normal disconnect
+
+async def watchdog():
+    """Monitor system health and restart tasks if they die"""
+    global fetch_task, connection_task, binance_connection_task, shutdown_requested
+    print("🐕 Starting HYBRID WEBSOCKET watchdog...")
+    
+    while not shutdown_requested:
+        try:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            
+            # Check if fetch task is still running
+            if fetch_task and fetch_task.done():
+                exception = fetch_task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="startup",
+                        severity="critical",
+                        message=f"fetch_symbols_loop task died: {str(exception)}",
+                        function_name="watchdog",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+                
+                print("🚨 fetch_symbols_loop task died, restarting...")
+                fetch_task = asyncio.create_task(fetch_symbols_loop())
+            
+            # Check if TwelveData connection task is still running
+            if connection_task and connection_task.done():
+                exception = connection_task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="connection",
+                        severity="critical",
+                        message=f"TwelveData maintain_connection task died: {str(exception)}",
+                        function_name="watchdog",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+                
+                print("🚨 TwelveData connection task died, restarting...")
+                connection_task = asyncio.create_task(maintain_connection())
+            
+            # Check if Binance connection task is still running
+            if binance_connection_task and binance_connection_task.done():
+                exception = binance_connection_task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="connection",
+                        severity="critical",
+                        message=f"Binance maintain_connection task died: {str(exception)}",
+                        function_name="watchdog",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+                
+                print("🚨 Binance connection task died, restarting...")
+                binance_connection_task = asyncio.create_task(maintain_binance_connection())
+            
+            # Check system health
+            now = datetime.now(timezone.utc)
+            time_since_price = (now - last_price_time).total_seconds()
+            
+            if time_since_price > 60:  # 🚀 REDUCED: 1 minute for real-time
+                await log_error_with_deduplication(
+                    error_type="timeout",
+                    severity="critical",
+                    message=f"No price updates for {int(time_since_price)} seconds - system may be stalled",
+                    function_name="watchdog",
+                    active_symbols_count=len(symbols)
+                )
+                print(f"💔 Health check failed - no prices for {int(time_since_price)}s")
+            else:
+                print(f"⚡ HYBRID MODE OK: last price {int(time_since_price)}s ago - TwelveData + Binance active")
+            
+        except asyncio.CancelledError:
+            print("🛑 Watchdog cancelled")
+            break
+        except Exception as e:
+            await log_error_with_deduplication(
+                error_type="network",
+                severity="error",
+                message=f"Watchdog error: {str(e)}",
+                function_name="watchdog",
+                stack_trace=traceback.format_exc()
+            )
+
+def handle_shutdown(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global shutdown_requested
+    print(f"\n🛑 Received signal {signum}, initiating graceful shutdown...")
+    shutdown_requested = True
+
+async def graceful_shutdown():
+    """Cancel all tasks gracefully"""
+    global fetch_task, connection_task, binance_connection_task, watchdog_task
+    print("🛑 Shutting down gracefully...")
+    
+    # 🚨 REAL MONEY: No buffered prices to flush - all inserted immediately
+    print("🚨 REAL MONEY MODE: No buffered prices to flush - all inserted immediately")
+    
+    tasks_to_cancel = []
+    if fetch_task and not fetch_task.done():
+        tasks_to_cancel.append(fetch_task)
+    if connection_task and not connection_task.done():
+        tasks_to_cancel.append(connection_task)
+    if binance_connection_task and not binance_connection_task.done():
+        tasks_to_cancel.append(binance_connection_task)
+    if watchdog_task and not watchdog_task.done():
+        tasks_to_cancel.append(watchdog_task)
+    
+    for task in tasks_to_cancel:
+        task.cancel()
+    
+    if tasks_to_cancel:
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+    
+    await log_error_with_deduplication(
+        error_type="shutdown",
+        severity="info",
+        message="HYBRID trading bot shutdown gracefully",
+        function_name="graceful_shutdown"
+    )
+    print("✅ All tasks cancelled, goodbye!")
+
+async def main():
+    """🚀 HYBRID main with TwelveData + Binance WebSocket connections"""
+    global fetch_task, connection_task, binance_connection_task, watchdog_task, shutdown_requested
+    restart_count = 0
+    max_restarts = 999999
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    
+    while restart_count < max_restarts and not shutdown_requested:
+        try:
+            print(f"🚨 HYBRID WEBSOCKET MODE: IMMEDIATE insertion - every price matters!")
+            print(f"💰 ZERO DELAYS: All symbols inserted instantly on every update")
+            print(f"📡 TwelveData: BTC/USD and other supported symbols")
+            print(f"📡 Binance: ETH/USD (ETHUSDT -> ETH/USD)")
+            
+            await log_error_with_deduplication(
+                error_type="startup",
+                severity="info",
+                message=f"HYBRID trading bot started (restart #{restart_count}) - TwelveData + Binance",
+                function_name="main",
+                active_symbols_count=0
+            )
+            
+            # Start all core tasks
+            fetch_task = asyncio.create_task(fetch_symbols_loop())
+            connection_task = asyncio.create_task(maintain_connection())  # TwelveData
+            binance_connection_task = asyncio.create_task(maintain_binance_connection())  # Binance
+            insert_task = asyncio.create_task(insert_prices_loop())
+            watchdog_task = asyncio.create_task(watchdog())
+            
+            print("✅ HYBRID WEBSOCKET tasks started:")
+            print("  📡 fetch_symbols_loop - Gets active symbols")
+            print("  🔗 maintain_connection - TwelveData WebSocket (BTC/USD, others)")
+            print("  🔗 maintain_binance_connection - Binance WebSocket (ETH/USD)")
+            print(f"  💰 insert_prices_loop - IMMEDIATE insertion on every price update")
+            print("  🐕 watchdog - Task monitoring and restart")
+            
+            # Wait for any task to complete (which shouldn't happen unless shutdown)
+            done, pending = await asyncio.wait(
+                [fetch_task, connection_task, binance_connection_task, insert_task, watchdog_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            if shutdown_requested:
+                break
+            
+            # If we get here, a core task died unexpectedly
+            restart_count += 1
+            for task in done:
+                exception = task.exception()
+                if exception:
+                    await log_error_with_deduplication(
+                        error_type="startup",
+                        severity="fatal",
+                        message=f"Core task crashed: {str(exception)}",
+                        function_name="main",
+                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                    )
+            
+            print(f"💥 Core task died, restarting entire bot (attempt {restart_count}/{max_restarts})...")
+            
+            # Cancel remaining tasks
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            
+            # Exponential backoff before restart
+            if restart_count < max_restarts:
+                await exponential_backoff(restart_count, base_delay=5, max_delay=120)
+            
+        except Exception as e:
+            restart_count += 1
+            await log_error_with_deduplication(
+                error_type="startup",
+                severity="fatal",
+                message=f"Main function crashed: {str(e)}",
+                function_name="main",
+                stack_trace=traceback.format_exc()
+            )
+            
+            if restart_count < max_restarts:
+                print(f"💀 Main crashed, restarting in 10s... (attempt {restart_count}/{max_restarts})")
+                await asyncio.sleep(10)
+            else:
+                print("💀 Max restarts reached, giving up!")
+                raise
+
+if __name__ == '__main__':
+    try:
+        print("🚀 HYBRID WEBSOCKET TRADING BOT STARTING...")
+        print("📡 Data Sources:")
+        print(f"   TwelveData: {TD_WEBSOCKET_URL}")
+        print(f"   Binance: {BINANCE_WEBSOCKET_URL}")
+        print("💰 Mode: IMMEDIATE insertion - every price update inserted instantly")
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🔴 Interrupted by user")
+    except Exception as e:
+        print(f"☠️ Fatal error: {e}")
+        sys.exit(1)
                 timeout=aiohttp.ClientTimeout(total=60, connect=20)  # 🔧 Increased timeouts
             )
             
@@ -222,6 +537,7 @@ async def fetch_symbols_loop():
                     print(f"✅ BTC/USD found: {symbol_map['BTC/USD']}")
                 if "ETH/USD" in symbol_map:
                     print(f"✅ ETH/USD found: {symbol_map['ETH/USD']}")
+                    print(f"   Will use Binance WebSocket for ETH/USD prices")
                 else:
                     print("❌ ETH/USD NOT found in symbol_map")
                 
@@ -292,7 +608,7 @@ async def receive_price(data):
     timestamp = data.get("timestamp")
 
     # 🔍 DEBUG: Log all incoming symbols
-    print(f"🔍 INCOMING: symbol='{symbol}', price={price}, timestamp={timestamp}")
+    print(f"🔍 INCOMING (TwelveData): symbol='{symbol}', price={price}, timestamp={timestamp}")
 
     # 🔧 TIMESTAMP FIX: Use current time if WebSocket timestamp is invalid
     try:
@@ -317,7 +633,7 @@ async def receive_price(data):
         price = 0
         print(f"❌ No price for {symbol}, inserting 0 IMMEDIATELY")
     else:
-        print(f"💰 REAL MONEY: {symbol}: ${price} - INSERTING NOW!")
+        print(f"💰 REAL MONEY (TwelveData): {symbol}: ${price} - INSERTING NOW!")
         last_price_time = datetime.now(timezone.utc)
 
     matched = symbol_map.get(symbol)
@@ -336,11 +652,54 @@ async def receive_price(data):
         "market_type": matched.get("market_type", "unknown"),
         "status": status,
         "search_symbol": matched.get("standardized_symbol", symbol),
-        "exchange": matched.get("exchange", None)
+        "exchange": "TwelveData"
     }
     
     # 🚨 CRITICAL: IMMEDIATE INSERT - NO WAITING!
-    print(f"🚨 IMMEDIATE INSERT: {symbol} @ ${price}")
+    print(f"🚨 IMMEDIATE INSERT (TwelveData): {symbol} @ ${price}")
+    asyncio.create_task(insert_single_price_immediate(price_data))
+
+async def receive_binance_price(data):
+    """🔧 NEW: Handle Binance ETHUSDT data and convert to ETH/USD format"""
+    global last_price_time
+    
+    # Binance ticker format: {"s":"ETHUSDT","c":"4791.99","o":"4778.40","h":"4956.78","l":"4720.00"}
+    binance_symbol = data.get("s")  # "ETHUSDT"
+    price = data.get("c")  # Current price
+    
+    # Convert to our database format
+    db_symbol = "ETH/USD"
+    
+    print(f"🔍 INCOMING (Binance): symbol='{binance_symbol}' -> '{db_symbol}', price={price}")
+    
+    # Check if we have ETH/USD in symbol_map
+    matched = symbol_map.get(db_symbol)
+    if not matched:
+        print(f"❌ No match in symbol_map for '{db_symbol}'")
+        print(f"🔍 Available symbols in map: {list(symbol_map.keys())}")
+        return
+    
+    if price is None:
+        price = 0
+        print(f"❌ No price for {db_symbol}, inserting 0 IMMEDIATELY")
+    else:
+        print(f"💰 REAL MONEY (Binance): {db_symbol}: ${price} - INSERTING NOW!")
+        last_price_time = datetime.now(timezone.utc)
+    
+    # Build price data
+    price_data = {
+        "symbol": db_symbol,  # ETH/USD
+        "standardized_symbol": matched.get("standardized_symbol", "ETH"),
+        "price": float(price) if price else 0,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "asset_name": matched.get("asset_name", "ETH/USD"),
+        "market_type": matched.get("market_type", "crypto"),
+        "status": "pulled",
+        "search_symbol": matched.get("standardized_symbol", "ETH"),
+        "exchange": "Binance"
+    }
+    
+    print(f"🚨 IMMEDIATE INSERT (Binance): {db_symbol} @ ${price}")
     asyncio.create_task(insert_single_price_immediate(price_data))
 
 async def insert_single_price_immediate(price_data):
@@ -348,8 +707,9 @@ async def insert_single_price_immediate(price_data):
     try:
         symbol = price_data["symbol"]
         price = price_data["price"]
+        exchange = price_data.get("exchange", "Unknown")
         
-        print(f"💰 INSERTING NOW: {symbol} @ ${price}")
+        print(f"💰 INSERTING NOW ({exchange}): {symbol} @ ${price}")
         
         # Transform to match live_prices table schema
         row = {
@@ -375,15 +735,15 @@ async def insert_single_price_immediate(price_data):
         duration_ms = (end_time - start_time).total_seconds() * 1000
         
         if result.data:
-            print(f"💰 INSERTED {symbol} in {duration_ms:.0f}ms @ ${price}")
+            print(f"💰 INSERTED ({exchange}) {symbol} in {duration_ms:.0f}ms @ ${price}")
         else:
-            print(f"⚠️ Insert failed for {symbol}")
+            print(f"⚠️ Insert failed for {symbol} from {exchange}")
             
     except Exception as e:
         await log_error_with_deduplication(
             error_type="database",
             severity="error",
-            message=f"IMMEDIATE insert failed for {price_data.get('symbol', 'unknown')}: {str(e)}",
+            message=f"IMMEDIATE insert failed for {price_data.get('symbol', 'unknown')} from {price_data.get('exchange', 'Unknown')}: {str(e)}",
             function_name="insert_single_price_immediate",
             stack_trace=traceback.format_exc()
         )
@@ -451,7 +811,7 @@ async def maintain_connection():
                 await asyncio.sleep(5)
                 continue
 
-            print(f"🔍 SYMBOLS CHECK: {len(symbols)} symbols available: {list(symbols)}")
+            print(f"🔍 TwelveData SYMBOLS CHECK: {len(symbols)} symbols available: {list(symbols)}")
             resubscribe = symbols != previous_symbols
             previous_symbols = set(symbols)
 
@@ -460,50 +820,38 @@ async def maintain_connection():
                 timeout=aiohttp.ClientTimeout(total=60, connect=15)
             )
 
-            print(f"🔗 Connecting to WebSocket... (failures: {consecutive_failures})")
+            print(f"🔗 Connecting to TwelveData WebSocket... (failures: {consecutive_failures})")
             print(f"🔗 WebSocket URL: {TD_WEBSOCKET_URL}")
             async with session.ws_connect(
                 TD_WEBSOCKET_URL,
                 heartbeat=30
             ) as ws:
-                print("✅ WebSocket connected successfully!")
+                print("✅ TwelveData WebSocket connected successfully!")
                 consecutive_failures = 0  # Reset on successful connection
                 
                 if resubscribe:
-                    print(f"🚀 ATTEMPTING SUBSCRIPTION with {len(symbols)} symbols...")
+                    print(f"🚀 ATTEMPTING TwelveData SUBSCRIPTION with {len(symbols)} symbols...")
                     
-                    # 🔧 ETH/USD WORKAROUND: Try alternative symbols if ETH/USD fails
-                    symbol_alternatives = {
-                        "ETH/USD": ["ETHUSD", "ETH-USD", "ETHEREUM/USD", "ETH/USDT"]
-                    }
-                    
-                    final_symbols = []
-                    for symbol in symbols:
-                        if symbol == "ETH/USD":
-                            # Try alternatives for ETH/USD since it fails
-                            for alt in symbol_alternatives["ETH/USD"]:
-                                final_symbols.append(alt)
-                                print(f"🔧 Adding ETH alternative: {alt}")
-                        else:
-                            final_symbols.append(symbol)
+                    # 🔧 REMOVED ETH WORKAROUND: Just use symbols as-is
+                    final_symbols = list(symbols)  # Clean subscription
                     
                     subscribe_payload = json.dumps({
                         "action": "subscribe",
                         "params": {
-                            "symbols": ",".join(final_symbols)  # 🔧 FIXED: Use original format
+                            "symbols": ",".join(final_symbols)
                         }
                     })
                     
-                    print(f"📤 SENDING SUBSCRIPTION...")
+                    print(f"📤 SENDING TwelveData SUBSCRIPTION...")
                     await ws.send_str(subscribe_payload)
-                    print(f"📤 🚀 REAL-TIME SUBSCRIBED: {len(symbols)} symbols ({list(symbols)})")
+                    print(f"📤 🚀 TwelveData SUBSCRIBED: {final_symbols}")
                     print(f"🔍 EXACT SUBSCRIPTION PAYLOAD: {subscribe_payload}")
                     
                     # 🚨 Wait for subscription confirmation
-                    print("⏳ Waiting for subscription confirmation...")
+                    print("⏳ Waiting for TwelveData subscription confirmation...")
                     
                 else:
-                    print("✅ Symbol list unchanged, skipping re-subscribe")
+                    print("✅ TwelveData symbol list unchanged, skipping re-subscribe")
 
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
                 timeout_task = asyncio.create_task(check_price_timeout())
@@ -516,25 +864,39 @@ async def maintain_connection():
                         try:
                             data = json.loads(msg.data)
                             # 🔍 DEBUG: Log ALL WebSocket messages
-                            print(f"🔍 RAW WEBSOCKET: {data}")
+                            print(f"🔍 RAW TwelveData WEBSOCKET: {data}")
                             
                             if data.get("event") == "price":
                                 # 🚨 CRITICAL: Process price immediately
-                                print(f"💰 PRICE EVENT RECEIVED: {data}")
+                                print(f"💰 TwelveData PRICE EVENT: {data}")
                                 await receive_price(data)
                             elif data.get("event") == "status":
-                                print(f"⚙️ Status event: {data}")
+                                print(f"⚙️ TwelveData Status: {data}")
                             elif data.get("event") == "subscribe-status":
-                                print(f"📋 SUBSCRIPTION STATUS: {data}")
+                                print(f"📋 TwelveData SUBSCRIPTION STATUS: {data}")
+                                
+                                # 🔍 Check individual subscription success/failure
+                                symbol = data.get("symbol")
+                                status = data.get("status")
+                                
+                                if symbol and status:
+                                    if status == "ok":
+                                        print(f"✅ TwelveData SUBSCRIPTION SUCCESS: {symbol}")
+                                    else:
+                                        print(f"❌ TwelveData SUBSCRIPTION FAILED: {symbol} - Status: {status}")
+                                        if symbol == "ETH/USD":
+                                            print(f"🚨 ETH/USD REJECTED BY TWELVEDATA!")
+                                            print(f"   Binance WebSocket will handle ETH/USD instead")
+                                            
                             elif data.get("event") == "heartbeat":
-                                print(f"💓 Heartbeat: {data.get('status', 'unknown')}")
+                                print(f"💓 TwelveData Heartbeat: {data.get('status', 'unknown')}")
                             else:
-                                print(f"🪵 Other event: {data}")
+                                print(f"🪵 TwelveData Other event: {data}")
                         except json.JSONDecodeError as e:
                             await log_error_with_deduplication(
                                 error_type="parsing",
                                 severity="warning",
-                                message=f"Error parsing WebSocket message: {str(e)}",
+                                message=f"Error parsing TwelveData WebSocket message: {str(e)}",
                                 function_name="maintain_connection",
                                 connection_state="connected",
                                 response_data={"raw_message": msg.data},
@@ -544,7 +906,7 @@ async def maintain_connection():
                             await log_error_with_deduplication(
                                 error_type="websocket",
                                 severity="error",
-                                message=f"Error processing WebSocket message: {str(e)}",
+                                message=f"Error processing TwelveData WebSocket message: {str(e)}",
                                 function_name="maintain_connection",
                                 connection_state="connected",
                                 stack_trace=traceback.format_exc(),
@@ -554,7 +916,7 @@ async def maintain_connection():
                         await log_error_with_deduplication(
                             error_type="websocket",
                             severity="error",
-                            message=f"WebSocket error: {msg.data}",
+                            message=f"TwelveData WebSocket error: {msg.data}",
                             function_name="maintain_connection",
                             connection_state="error",
                             response_data={"error_data": str(msg.data)},
@@ -562,18 +924,18 @@ async def maintain_connection():
                         )
                         break
                     elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        print("🔌 WebSocket closed by server")
+                        print("🔌 TwelveData WebSocket closed by server")
                         break
                         
         except asyncio.CancelledError:
-            print("🛑 maintain_connection cancelled")
+            print("🛑 TwelveData maintain_connection cancelled")
             break
         except aiohttp.ClientError as e:
             consecutive_failures += 1
             await log_error_with_deduplication(
                 error_type="connection",
                 severity="error",
-                message=f"WebSocket connection error: {str(e)}",
+                message=f"TwelveData WebSocket connection error: {str(e)}",
                 function_name="maintain_connection",
                 connection_state="failed",
                 stack_trace=traceback.format_exc(),
@@ -584,7 +946,7 @@ async def maintain_connection():
             await log_error_with_deduplication(
                 error_type="connection",
                 severity="error",
-                message=f"Unexpected error in maintain_connection: {str(e)}",
+                message=f"Unexpected error in TwelveData maintain_connection: {str(e)}",
                 function_name="maintain_connection",
                 connection_state="failed",
                 stack_trace=traceback.format_exc(),
@@ -616,199 +978,20 @@ async def maintain_connection():
             else:
                 await asyncio.sleep(1)  # Brief pause on normal disconnect
 
-async def watchdog():
-    """Monitor system health and restart tasks if they die"""
-    global fetch_task, connection_task, shutdown_requested
-    print("🐕 Starting REAL-TIME watchdog...")
+async def maintain_binance_connection():
+    """🔧 NEW: Binance connection specifically for ETH/USD"""
+    global shutdown_requested
+    consecutive_failures = 0
     
     while not shutdown_requested:
+        session = None
         try:
-            await asyncio.sleep(10)  # Check every 10 seconds
-            
-            # Check if fetch task is still running
-            if fetch_task and fetch_task.done():
-                exception = fetch_task.exception()
-                if exception:
-                    await log_error_with_deduplication(
-                        error_type="startup",
-                        severity="critical",
-                        message=f"fetch_symbols_loop task died: {str(exception)}",
-                        function_name="watchdog",
-                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
-                    )
-                
-                print("🚨 fetch_symbols_loop task died, restarting...")
-                fetch_task = asyncio.create_task(fetch_symbols_loop())
-            
-            # Check if connection task is still running
-            if connection_task and connection_task.done():
-                exception = connection_task.exception()
-                if exception:
-                    await log_error_with_deduplication(
-                        error_type="connection",
-                        severity="critical",
-                        message=f"maintain_connection task died: {str(exception)}",
-                        function_name="watchdog",
-                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
-                    )
-                
-                print("🚨 maintain_connection task died, restarting...")
-                connection_task = asyncio.create_task(maintain_connection())
-            
-            # Check system health
-            now = datetime.now(timezone.utc)
-            time_since_price = (now - last_price_time).total_seconds()
-            
-            if time_since_price > 60:  # 🚀 REDUCED: 1 minute for real-time
-                await log_error_with_deduplication(
-                    error_type="timeout",
-                    severity="critical",
-                    message=f"No price updates for {int(time_since_price)} seconds - system may be stalled",
-                    function_name="watchdog",
-                    active_symbols_count=len(symbols)
-                )
-                print(f"💔 Health check failed - no prices for {int(time_since_price)}s")
-            else:
-                print(f"⚡ REAL MONEY OK: last price {int(time_since_price)}s ago - all prices inserted immediately")
-            
-        except asyncio.CancelledError:
-            print("🛑 Watchdog cancelled")
-            break
-        except Exception as e:
-            await log_error_with_deduplication(
-                error_type="network",
-                severity="error",
-                message=f"Watchdog error: {str(e)}",
-                function_name="watchdog",
-                stack_trace=traceback.format_exc()
-            )
+            # Only connect if we have ETH/USD in our symbols
+            if "ETH/USD" not in symbol_map:
+                print("⚠️ No ETH/USD in symbol_map, skipping Binance connection")
+                await asyncio.sleep(5)
+                continue
 
-def handle_shutdown(signum, frame):
-    """Handle shutdown signals gracefully"""
-    global shutdown_requested
-    print(f"\n🛑 Received signal {signum}, initiating graceful shutdown...")
-    shutdown_requested = True
-
-async def graceful_shutdown():
-    """Cancel all tasks gracefully"""
-    global fetch_task, connection_task, watchdog_task
-    print("🛑 Shutting down gracefully...")
-    
-    # 🚨 REAL MONEY: No buffered prices to flush - all inserted immediately
-    print("🚨 REAL MONEY MODE: No buffered prices to flush - all inserted immediately")
-    
-    tasks_to_cancel = []
-    if fetch_task and not fetch_task.done():
-        tasks_to_cancel.append(fetch_task)
-    if connection_task and not connection_task.done():
-        tasks_to_cancel.append(connection_task)
-    if watchdog_task and not watchdog_task.done():
-        tasks_to_cancel.append(watchdog_task)
-    
-    for task in tasks_to_cancel:
-        task.cancel()
-    
-    if tasks_to_cancel:
-        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-    
-    await log_error_with_deduplication(
-        error_type="shutdown",
-        severity="info",
-        message="REAL-TIME trading bot shutdown gracefully",
-        function_name="graceful_shutdown"
-    )
-    print("✅ All tasks cancelled, goodbye!")
-
-async def main():
-    """🚀 REAL-TIME main with optimized task supervision"""
-    global fetch_task, connection_task, watchdog_task, shutdown_requested
-    restart_count = 0
-    max_restarts = 999999
-    
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    
-    while restart_count < max_restarts and not shutdown_requested:
-        try:
-            print(f"🚨 REAL MONEY MODE: IMMEDIATE insertion - every price matters!")
-            print(f"💰 ZERO DELAYS: All symbols inserted instantly on every update")
+            print(f"🔍 BINANCE: Connecting for ETH/USD (ETHUSDT)")
             
-            await log_error_with_deduplication(
-                error_type="startup",
-                severity="info",
-                message=f"REAL-TIME trading bot started (restart #{restart_count})",
-                function_name="main",
-                active_symbols_count=0
-            )
-            
-            # Start all core tasks
-            fetch_task = asyncio.create_task(fetch_symbols_loop())
-            connection_task = asyncio.create_task(maintain_connection())
-            insert_task = asyncio.create_task(insert_prices_loop())
-            watchdog_task = asyncio.create_task(watchdog())
-            
-            print("✅ REAL MONEY MODE tasks started:")
-            print("  📡 fetch_symbols_loop - Gets active symbols")
-            print("  🔗 maintain_connection - WebSocket price streaming")
-            print(f"  💰 insert_prices_loop - IMMEDIATE insertion on every price update")
-            print("  🐕 watchdog - Task monitoring and restart")
-            
-            # Wait for any task to complete (which shouldn't happen unless shutdown)
-            done, pending = await asyncio.wait(
-                [fetch_task, connection_task, insert_task, watchdog_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            if shutdown_requested:
-                break
-            
-            # If we get here, a core task died unexpectedly
-            restart_count += 1
-            for task in done:
-                exception = task.exception()
-                if exception:
-                    await log_error_with_deduplication(
-                        error_type="startup",
-                        severity="fatal",
-                        message=f"Core task crashed: {str(exception)}",
-                        function_name="main",
-                        stack_trace="".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
-                    )
-            
-            print(f"💥 Core task died, restarting entire bot (attempt {restart_count}/{max_restarts})...")
-            
-            # Cancel remaining tasks
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            
-            # Exponential backoff before restart
-            if restart_count < max_restarts:
-                await exponential_backoff(restart_count, base_delay=5, max_delay=120)
-            
-        except Exception as e:
-            restart_count += 1
-            await log_error_with_deduplication(
-                error_type="startup",
-                severity="fatal",
-                message=f"Main function crashed: {str(e)}",
-                function_name="main",
-                stack_trace=traceback.format_exc()
-            )
-            
-            if restart_count < max_restarts:
-                print(f"💀 Main crashed, restarting in 10s... (attempt {restart_count}/{max_restarts})")
-                await asyncio.sleep(10)
-            else:
-                print("💀 Max restarts reached, giving up!")
-                raise
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🔴 Interrupted by user")
-    except Exception as e:
-        print(f"☠️ Fatal error: {e}")
-        sys.exit(1)
+            session = aiohttp.ClientSession(
