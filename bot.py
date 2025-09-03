@@ -18,7 +18,7 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 TD_WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
-# Binance WebSocket for crypto pairs
+# Fixed Binance WebSocket URL
 BINANCE_CRYPTO_STREAMS = [
     "ethusdt@ticker",
     "btcusdt@ticker", 
@@ -29,17 +29,20 @@ BINANCE_CRYPTO_STREAMS = [
     "avaxusdt@ticker",
     "maticusdt@ticker"
 ]
-BINANCE_WEBSOCKET_URL = f"wss://stream.binance.com:9443/stream?streams={'/'.join(BINANCE_CRYPTO_STREAMS)}"
+# Use single stream format for better reliability
+BINANCE_WEBSOCKET_URL = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Shared state
 symbols = set()
 symbol_map = {}
-unique_symbols = set()  # Deduplicated symbols for actual subscription
-successful_subscriptions = set()  # Track which symbols are actually working
+unique_symbols = set()
+successful_subscriptions = set()
 last_price_time = datetime.now(timezone.utc)
 shutdown_requested = False
+twelvedata_working = False  # Track TwelveData status
+binance_active = False      # Track Binance fallback status
 
 # Task monitoring
 fetch_task = None
@@ -49,7 +52,7 @@ watchdog_task = None
 
 # Symbol prioritization for TwelveData (most important first)
 PRIORITY_SYMBOLS = [
-    "BTC/USD", "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", 
+    "BTC/USD", "ETH/USD", "AAPL", "TSLA", "NVDA", "MSFT", "AMZN", 
     "GOOGL", "EUR/USD", "GBP/USD", "USD/JPY"
 ]
 
@@ -272,13 +275,15 @@ async def fetch_symbols_loop():
 
 async def receive_twelvedata_price(data):
     """Handle TwelveData price events"""
-    global last_price_time
+    global last_price_time, twelvedata_working
 
     symbol = data.get("symbol")
     price = data.get("price")
     timestamp = data.get("timestamp")
 
     print(f"TwelveData: {symbol}: ${price}")
+    twelvedata_working = True
+    last_price_time = datetime.now(timezone.utc)
 
     # Fix timestamp
     try:
@@ -297,7 +302,6 @@ async def receive_twelvedata_price(data):
     if price is None:
         price = 0
 
-    last_price_time = datetime.now(timezone.utc)
     successful_subscriptions.add(symbol)
 
     matched = symbol_map.get(symbol)
@@ -320,8 +324,11 @@ async def receive_twelvedata_price(data):
     asyncio.create_task(insert_single_price_immediate(price_data))
 
 async def receive_binance_price(data):
-    """Handle Binance price events"""
-    global last_price_time
+    """Handle Binance price events - only when TwelveData is not working"""
+    global last_price_time, binance_active
+    
+    if not binance_active:
+        return  # Skip if Binance fallback is not active
     
     # Handle stream format: {"stream":"ethusdt@ticker","data":{...}}
     if "data" in data:
@@ -341,7 +348,7 @@ async def receive_binance_price(data):
         print(f"Unknown Binance symbol: {binance_symbol}")
         return
     
-    print(f"Binance: {binance_symbol} -> {db_symbol}: ${price}")
+    print(f"Binance (FALLBACK): {binance_symbol} -> {db_symbol}: ${price}")
     
     # Skip if we don't have this symbol in our game assets
     matched = symbol_map.get(db_symbol)
@@ -410,8 +417,8 @@ async def insert_single_price_immediate(price_data):
         )
 
 async def maintain_twelvedata_connection():
-    """TwelveData WebSocket connection with 8-symbol limit"""
-    global shutdown_requested
+    """TwelveData WebSocket connection - PRIMARY source"""
+    global shutdown_requested, twelvedata_working, binance_active
     consecutive_failures = 0
     heartbeat_task = None
     timeout_task = None
@@ -425,26 +432,21 @@ async def maintain_twelvedata_connection():
                 await asyncio.sleep(5)
                 continue
 
-            # Select up to 8 symbols for TwelveData (respecting plan limits)
-            # Exclude crypto symbols that Binance handles
-            binance_handled = set(BINANCE_SYMBOL_MAP.values())
-            twelvedata_candidates = [s for s in unique_symbols if s not in binance_handled]
-            
-            # Prioritize and limit to 8
+            # Use ALL available symbols for TwelveData (up to 8)
             subscription_symbols = []
             
             # Add priority symbols first
             for priority in PRIORITY_SYMBOLS:
-                if priority in twelvedata_candidates and len(subscription_symbols) < 8:
+                if priority in unique_symbols and len(subscription_symbols) < 8:
                     subscription_symbols.append(priority)
             
             # Fill remaining slots
-            for symbol in twelvedata_candidates:
+            for symbol in unique_symbols:
                 if symbol not in subscription_symbols and len(subscription_symbols) < 8:
                     subscription_symbols.append(symbol)
 
             if not subscription_symbols:
-                print("No TwelveData symbols after filtering")
+                print("No symbols available for TwelveData")
                 await asyncio.sleep(10)
                 continue
 
@@ -459,6 +461,8 @@ async def maintain_twelvedata_connection():
             async with session.ws_connect(TD_WEBSOCKET_URL, heartbeat=30) as ws:
                 print("TwelveData WebSocket connected successfully!")
                 consecutive_failures = 0
+                twelvedata_working = False  # Reset until we get data
+                binance_active = False      # Disable Binance while trying TwelveData
                 
                 if resubscribe:
                     print(f"TwelveData subscribing to {len(subscription_symbols)} symbols: {subscription_symbols}")
@@ -483,15 +487,11 @@ async def maintain_twelvedata_connection():
                             break
 
                 async def check_timeout():
-                    while not shutdown_requested:
-                        try:
-                            await asyncio.sleep(5)
-                            now = datetime.now(timezone.utc)
-                            delta = (now - last_price_time).total_seconds()
-                            if delta > 30:
-                                raise Exception("Price timeout")
-                        except Exception:
-                            break
+                    await asyncio.sleep(30)  # Give TwelveData 30 seconds to start working
+                    if not twelvedata_working and not shutdown_requested:
+                        print("TwelveData timeout - activating Binance fallback")
+                        global binance_active
+                        binance_active = True
 
                 heartbeat_task = asyncio.create_task(send_heartbeat())
                 timeout_task = asyncio.create_task(check_timeout())
@@ -512,9 +512,13 @@ async def maintain_twelvedata_connection():
                                 
                                 if success_symbols:
                                     print(f"TwelveData subscription SUCCESS: {success_symbols}")
+                                    twelvedata_working = True
+                                    binance_active = False  # Disable Binance since TwelveData is working
                                 if failed_symbols:
                                     print(f"TwelveData subscription FAILED: {failed_symbols}")
-                                    print("These symbols may not be available on your plan")
+                                    # If all symbols failed, activate Binance
+                                    if not success_symbols:
+                                        binance_active = True
                             elif data.get("event") == "heartbeat":
                                 print(f"TwelveData heartbeat: {data.get('status', 'ok')}")
                             else:
@@ -538,6 +542,8 @@ async def maintain_twelvedata_connection():
             break
         except Exception as e:
             consecutive_failures += 1
+            twelvedata_working = False
+            binance_active = True  # Activate Binance fallback on TwelveData failure
             await log_error_with_deduplication(
                 error_type="connection",
                 severity="error",
@@ -545,6 +551,7 @@ async def maintain_twelvedata_connection():
                 function_name="maintain_twelvedata_connection",
                 stack_trace=traceback.format_exc()
             )
+            print(f"TwelveData failed, activating Binance fallback")
         finally:
             # Cleanup
             if heartbeat_task and not heartbeat_task.done():
@@ -570,13 +577,18 @@ async def maintain_twelvedata_connection():
                 await asyncio.sleep(1)
 
 async def maintain_binance_connection():
-    """Binance WebSocket connection for crypto pairs"""
-    global shutdown_requested
+    """Binance WebSocket connection - FALLBACK when TwelveData fails"""
+    global shutdown_requested, binance_active
     consecutive_failures = 0
     
     while not shutdown_requested:
         session = None
         try:
+            # Only connect if Binance fallback is active
+            if not binance_active:
+                await asyncio.sleep(5)
+                continue
+                
             # Check if any Binance-handled symbols are in our game assets
             binance_symbols_needed = []
             for binance_sym, db_sym in BINANCE_SYMBOL_MAP.items():
@@ -592,15 +604,19 @@ async def maintain_binance_connection():
                 timeout=aiohttp.ClientTimeout(total=60, connect=15)
             )
             
-            print(f"Connecting to Binance WebSocket (failures: {consecutive_failures})")
+            print(f"Connecting to Binance WebSocket FALLBACK (failures: {consecutive_failures})")
             print(f"Binance symbols needed: {binance_symbols_needed}")
             
-            async with session.ws_connect(BINANCE_WEBSOCKET_URL) as ws:
-                print("Binance WebSocket connected!")
+            # Use simple single stream URL for BTC
+            simple_url = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+            
+            async with session.ws_connect(simple_url) as ws:
+                print("Binance WebSocket connected (FALLBACK MODE)!")
                 consecutive_failures = 0
                 
                 async for msg in ws:
-                    if shutdown_requested:
+                    if shutdown_requested or not binance_active:
+                        print("Binance fallback deactivated, closing connection")
                         break
                         
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -652,7 +668,7 @@ async def maintain_binance_connection():
 
 async def watchdog():
     """Monitor system health and restart tasks"""
-    global fetch_task, twelvedata_task, binance_task, shutdown_requested
+    global fetch_task, twelvedata_task, binance_task, shutdown_requested, twelvedata_working, binance_active
     print("Starting watchdog...")
     
     while not shutdown_requested:
@@ -685,6 +701,8 @@ async def watchdog():
                     )
                 
                 print("TwelveData connection died, restarting...")
+                twelvedata_working = False
+                binance_active = True
                 twelvedata_task = asyncio.create_task(maintain_twelvedata_connection())
             
             # Check Binance task
@@ -701,9 +719,11 @@ async def watchdog():
                 print("Binance connection died, restarting...")
                 binance_task = asyncio.create_task(maintain_binance_connection())
             
-            # Health check
+            # Health check and status report
             now = datetime.now(timezone.utc)
             time_since_price = (now - last_price_time).total_seconds()
+            
+            status = "TwelveData" if twelvedata_working else ("Binance Fallback" if binance_active else "No Connection")
             
             if time_since_price > 60:
                 await log_error_with_deduplication(
@@ -713,10 +733,16 @@ async def watchdog():
                     function_name="watchdog",
                     active_symbols_count=len(symbols)
                 )
-                print(f"Health check failed - no prices for {int(time_since_price)}s")
+                print(f"Health check failed - no prices for {int(time_since_price)}s [{status}]")
+                
+                # If no prices for too long, switch to Binance fallback
+                if not binance_active and time_since_price > 120:
+                    print("Forcing Binance fallback due to extended price timeout")
+                    binance_active = True
+                    twelvedata_working = False
             else:
                 working_symbols = len(successful_subscriptions)
-                print(f"System OK: {working_symbols} symbols active, last price {int(time_since_price)}s ago")
+                print(f"System OK [{status}]: {working_symbols} symbols active, last price {int(time_since_price)}s ago")
             
         except asyncio.CancelledError:
             print("Watchdog cancelled")
@@ -766,7 +792,7 @@ async def graceful_shutdown():
     print("All tasks cancelled, goodbye!")
 
 async def main():
-    """Main function with hybrid WebSocket connections"""
+    """Main function with TwelveData priority and Binance fallback"""
     global fetch_task, twelvedata_task, binance_task, watchdog_task, shutdown_requested
     restart_count = 0
     max_restarts = 999999
@@ -776,15 +802,15 @@ async def main():
     
     while restart_count < max_restarts and not shutdown_requested:
         try:
-            print("HYBRID WEBSOCKET MODE: TwelveData + Binance")
-            print("- TwelveData: Max 8 symbols (stocks, forex)")
-            print("- Binance: Crypto pairs (unlimited)")
-            print("- Deduplication: Only unique symbols from game assets")
+            print("PRIORITY WEBSOCKET MODE: TwelveData PRIMARY + Binance FALLBACK")
+            print("- TwelveData: Primary source (up to 8 symbols)")
+            print("- Binance: Fallback only when TwelveData fails")
+            print("- Automatic failover and retry logic")
             
             await log_error_with_deduplication(
                 error_type="startup",
                 severity="info",
-                message=f"Hybrid trading bot started (restart #{restart_count})",
+                message=f"Priority trading bot started (restart #{restart_count})",
                 function_name="main",
                 active_symbols_count=0
             )
@@ -796,10 +822,10 @@ async def main():
             watchdog_task = asyncio.create_task(watchdog())
             
             print("Tasks started:")
-            print("  - fetch_symbols_loop: Gets unique symbols from game_assets_view")
-            print("  - maintain_twelvedata_connection: Up to 8 non-crypto symbols")
-            print("  - maintain_binance_connection: All crypto symbols")
-            print("  - watchdog: Task monitoring and restart")
+            print("  - fetch_symbols_loop: Gets symbols from game_assets_view")
+            print("  - maintain_twelvedata_connection: PRIMARY price source")
+            print("  - maintain_binance_connection: FALLBACK when TwelveData fails")
+            print("  - watchdog: Health monitoring and task restart")
             
             # Wait for any task to complete
             done, pending = await asyncio.wait(
@@ -854,10 +880,10 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        print("HYBRID WEBSOCKET TRADING BOT STARTING...")
+        print("PRIORITY WEBSOCKET TRADING BOT STARTING...")
         print(f"TwelveData: {TD_WEBSOCKET_URL}")
-        print(f"Binance: {BINANCE_WEBSOCKET_URL}")
-        print("Mode: Immediate insertion with deduplication")
+        print(f"Binance Fallback: wss://stream.binance.com:9443/ws/btcusdt@ticker")
+        print("Mode: TwelveData priority with Binance fallback")
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nInterrupted by user")
