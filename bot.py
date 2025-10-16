@@ -1,12 +1,10 @@
 """
-PRODUCTION TRADING BOT v2.0
+PRODUCTION TRADING BOT - FINAL VERSION
+- TwelveData WebSocket (8 unique symbols max on Basic/Grow plans)
+- Pulls prices every ~2 seconds
+- Inserts directly to live_prices table (one row per symbol)
 - Auto-restart with watchdog
-- Heartbeat monitoring every 30s
-- Deduplication (10 BTC games = 1 symbol)
-- TwelveData: Max 8 unique symbols
-- Binance: Unlimited crypto
-- Immediate price insertion
-- All USD-focused
+- Heartbeat monitoring
 """
 import asyncio
 import json
@@ -30,69 +28,32 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 TD_WEBSOCKET_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_API_KEY}"
 FETCH_SYMBOLS_ENDPOINT = f"{SUPABASE_URL}/functions/v1/fetch-symbols"
 
-# Binance crypto streams (can add more as needed)
-BINANCE_CRYPTO_STREAMS = [
-    "btcusdt@ticker",
-    "ethusdt@ticker",
-    "adausdt@ticker",
-    "solusdt@ticker",
-    "xrpusdt@ticker",
-    "dogeusdt@ticker",
-    "avaxusdt@ticker",
-    "maticusdt@ticker",
-    "linkusdt@ticker",
-    "dotusdt@ticker",
-    "uniusdt@ticker",
-    "ltcusdt@ticker",
-    "bchusdt@ticker"
-]
-BINANCE_WEBSOCKET_URL = f"wss://stream.binance.com:443/stream?streams={'/'.join(BINANCE_CRYPTO_STREAMS)}"
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ========================================
 # GLOBAL STATE
 # ========================================
-symbols = set()  # All symbols from game_assets_view
+symbols = set()  # All unique symbols from fetch-symbols
 symbol_map = {}  # Symbol details for mapping
 unique_symbols = []  # Ordered list for prioritization
-active_twelvedata_symbols = []  # Currently subscribed to TwelveData (max 8)
-active_binance_symbols = set()  # Crypto symbols handled by Binance
+active_symbols = []  # Currently subscribed to TwelveData
 last_price_time = datetime.now(timezone.utc)
 shutdown_requested = False
 
 # Task references
 fetch_task = None
 twelvedata_task = None
-binance_task = None
 watchdog_task = None
 heartbeat_task = None
 
 # ========================================
-# SYMBOL PRIORITY & MAPPING
+# SYMBOL PRIORITY
 # ========================================
-# Most important symbols first (for TwelveData 8-limit)
+# Most important symbols first (for 8-symbol limit)
 PRIORITY_SYMBOLS = [
-    "BTC/USD", "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
+    "BTC/USD", "ETH/USD", "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
     "GOOGL", "META", "EUR/USD", "GBP/USD", "USD/JPY"
 ]
-
-# Binance ticker to database symbol mapping
-BINANCE_SYMBOL_MAP = {
-    "BTCUSDT": "BTC/USD",
-    "ETHUSDT": "ETH/USD",
-    "ADAUSDT": "ADA/USD",
-    "SOLUSDT": "SOL/USD",
-    "XRPUSDT": "XRP/USD",
-    "DOGEUSDT": "DOGE/USD",
-    "AVAXUSDT": "AVAX/USD",
-    "MATICUSDT": "MATIC/USD",
-    "LINKUSDT": "LINK/USD",
-    "DOTUSDT": "DOT/USD",
-    "UNIUSDT": "UNI/USD",
-    "LTCUSDT": "LTC/USD",
-    "BCHUSDT": "BCH/USD"
-}
 
 # ========================================
 # UTILITY FUNCTIONS
@@ -136,7 +97,6 @@ async def log_error(error_type, severity, message, function_name=None,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "active_symbols_count": len(symbols)
             }).eq("id", error_record["id"]).execute()
-            print(f"📝 Updated error #{error_record['id']}: {message[:50]}...")
         else:
             # Insert new error
             error_data = {
@@ -152,14 +112,10 @@ async def log_error(error_type, severity, message, function_name=None,
                 "last_occurrence": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-
-            result = supabase.table("bot_errors").insert(error_data).execute()
-            if result.data:
-                print(f"📝 Logged new error: {message[:50]}...")
+            supabase.table("bot_errors").insert(error_data).execute()
 
     except Exception as e:
         print(f"⚠️  Failed to log error: {e}")
-        print(f"   Original error: {message}")
 
 async def clear_live_prices():
     """Clear all rows from live_prices table"""
@@ -170,29 +126,19 @@ async def clear_live_prices():
         if row_count > 0:
             result = supabase.table("live_prices").delete().neq("symbol", "").execute()
             print(f"🗑️  Cleared {row_count} rows from live_prices")
-        else:
-            print("ℹ️  live_prices was already empty")
 
-        await log_error(
-            error_type="symbol_fetch",
-            severity="warning",
-            message=f"No symbols from fetch-symbols, cleared {row_count} rows",
-            function_name="clear_live_prices"
-        )
     except Exception as e:
         await log_error(
-            error_type="database",
-            severity="error",
-            message=f"Failed to clear live_prices: {str(e)}",
-            function_name="clear_live_prices",
-            stack_trace=traceback.format_exc()
+            "database", "error",
+            f"Failed to clear live_prices: {str(e)}",
+            "clear_live_prices"
         )
 
 # ========================================
 # SYMBOL FETCHING
 # ========================================
 async def fetch_symbols_loop():
-    """Fetch unique symbols from game_assets_view"""
+    """Fetch unique symbols from fetch-symbols edge function"""
     global symbols, symbol_map, unique_symbols, shutdown_requested
     consecutive_failures = 0
 
@@ -203,7 +149,7 @@ async def fetch_symbols_loop():
                 timeout=aiohttp.ClientTimeout(total=60, connect=20)
             )
 
-            print(f"\n🔍 Fetching symbols from game_assets_view...")
+            print(f"\n🔍 Fetching symbols from fetch-symbols...")
             async with session.post(
                 FETCH_SYMBOLS_ENDPOINT,
                 headers={
@@ -238,7 +184,7 @@ async def fetch_symbols_loop():
                     await exponential_backoff(consecutive_failures, base_delay=10)
                     continue
 
-                # 🔑 Update state with deduplicated symbols
+                # Update state with deduplicated symbols
                 new_symbols = set()
                 new_map = {}
 
@@ -251,8 +197,8 @@ async def fetch_symbols_loop():
                     new_map[symbol_str] = {
                         "market_id": row.get("market_id"),
                         "symbol": symbol_str,
-                        "standardized_symbol": row.get("standardized_symbol"),
-                        "asset_name": row.get("asset_name"),
+                        "standardized_symbol": row.get("standardized_symbol", symbol_str),
+                        "asset_name": row.get("asset_name", symbol_str),
                         "market_type": row.get("market_type", "unknown"),
                         "exchange": row.get("exchange"),
                         "currency": row.get("currency", "USD"),
@@ -262,15 +208,11 @@ async def fetch_symbols_loop():
                 symbols = new_symbols
                 symbol_map = new_map
 
-                # 🎯 Prioritize symbols for TwelveData (max 8)
+                # Prioritize symbols (for 8-symbol limit)
                 prioritized = []
-
-                # Add priority symbols first
                 for priority_sym in PRIORITY_SYMBOLS:
                     if priority_sym in symbols:
                         prioritized.append(priority_sym)
-
-                # Add remaining symbols
                 for sym in sorted(symbols):
                     if sym not in prioritized:
                         prioritized.append(sym)
@@ -279,7 +221,14 @@ async def fetch_symbols_loop():
 
                 consecutive_failures = 0
                 print(f"✅ Loaded {len(symbols)} unique symbols")
-                print(f"📋 Top 10: {', '.join(unique_symbols[:10])}")
+                
+                # Display up to 8 symbols (TwelveData WebSocket limit)
+                if unique_symbols:
+                    if len(unique_symbols) <= 8:
+                        print(f"📋 Symbols (all {len(unique_symbols)}): {', '.join(unique_symbols)}")
+                    else:
+                        print(f"📋 Top 8 symbols: {', '.join(unique_symbols[:8])}")
+                        print(f"   (Total: {len(unique_symbols)} symbols, only first 8 will be subscribed)")
 
                 await asyncio.sleep(60)  # Check every minute
 
@@ -300,35 +249,41 @@ async def fetch_symbols_loop():
                 await session.close()
 
 # ========================================
-# PRICE INSERTION
+# PRICE INSERTION (DIRECT TO live_prices)
 # ========================================
-async def insert_single_price(price_data):
-    """Insert single price immediately to live_prices"""
+async def insert_price_to_db(price_data):
+    """
+    Insert price directly to live_prices table
+    One row per symbol, updated every ~2 seconds
+    """
     try:
         symbol = price_data["symbol"]
         price = price_data["price"]
-        exchange = price_data.get("exchange", "Unknown")
 
+        # Prepare row for live_prices table
         row = {
-            "symbol": price_data["symbol"],
+            "symbol": symbol,
             "standardized_symbol": price_data["standardized_symbol"],
             "search_symbol": price_data["search_symbol"],
             "name": price_data["asset_name"],
             "market_type": price_data["market_type"],
-            "exchange": price_data["exchange"],
-            "price": price_data["price"],
+            "exchange": "TwelveData",
+            "price": price,
             "status": price_data["status"],
             "updated_at": price_data["updated_at"]
         }
 
+        # UPSERT: Insert or update if symbol exists
+        # This ensures ONE row per symbol in live_prices
         start = datetime.now()
         result = supabase.table("live_prices").upsert(
-            row, on_conflict="symbol"
+            row, 
+            on_conflict="symbol"  # Primary key
         ).execute()
         duration = (datetime.now() - start).total_seconds() * 1000
 
         if result.data:
-            print(f"💾 {symbol.ljust(12)} ${str(price).ljust(10)} ({exchange.ljust(11)}) [{duration:.0f}ms]")
+            print(f"💾 {symbol.ljust(12)} ${str(price).ljust(10)} [{duration:.0f}ms]")
         else:
             print(f"⚠️  Insert failed: {symbol}")
 
@@ -336,13 +291,13 @@ async def insert_single_price(price_data):
         await log_error(
             "database", "error",
             f"Insert failed for {price_data.get('symbol')}: {str(e)}",
-            "insert_single_price"
+            "insert_price_to_db"
         )
 
 # ========================================
 # TWELVEDATA WEBSOCKET
 # ========================================
-async def receive_twelvedata_price(data):
+async def receive_price(data):
     """Handle TwelveData price events"""
     global last_price_time
 
@@ -366,13 +321,15 @@ async def receive_twelvedata_price(data):
     status = "pulled" if price is not None else "failed"
     if price is None:
         price = 0
-
-    last_price_time = datetime.now(timezone.utc)
+    else:
+        last_price_time = datetime.now(timezone.utc)
 
     matched = symbol_map.get(symbol)
     if not matched:
+        print(f"⚠️  Price received for unmapped symbol: {symbol}")
         return
 
+    # Prepare price data for insertion
     price_data = {
         "symbol": symbol,
         "standardized_symbol": matched.get("standardized_symbol", symbol),
@@ -381,15 +338,15 @@ async def receive_twelvedata_price(data):
         "asset_name": matched.get("asset_name", symbol),
         "market_type": matched.get("market_type", "unknown"),
         "status": status,
-        "search_symbol": matched.get("standardized_symbol", symbol),
-        "exchange": "TwelveData"
+        "search_symbol": matched.get("search_symbol", symbol)
     }
 
-    asyncio.create_task(insert_single_price(price_data))
+    # Insert directly to live_prices table
+    asyncio.create_task(insert_price_to_db(price_data))
 
 async def maintain_twelvedata_connection():
-    """TwelveData WebSocket - Max 8 unique symbols"""
-    global shutdown_requested, active_twelvedata_symbols
+    """TwelveData WebSocket connection"""
+    global shutdown_requested, active_symbols
     consecutive_failures = 0
     previous_symbols = []
     heartbeat_task_local = None
@@ -400,24 +357,21 @@ async def maintain_twelvedata_connection():
 
         try:
             if not unique_symbols:
-                print("⏸️  No symbols for TwelveData, waiting...")
+                print("⏸️  No symbols available, waiting...")
                 await asyncio.sleep(5)
                 continue
 
-            # 🎯 Select up to 8 non-crypto symbols for TwelveData
-            binance_handled = set(BINANCE_SYMBOL_MAP.values())
-            twelvedata_candidates = [s for s in unique_symbols if s not in binance_handled]
-
-            subscription_symbols = twelvedata_candidates[:8]  # Max 8
+            # Subscribe to up to 8 symbols (TwelveData limit for Basic/Grow plans)
+            subscription_symbols = unique_symbols[:8]
 
             if not subscription_symbols:
-                print("⏸️  No TwelveData symbols (all handled by Binance)")
+                print("⏸️  No symbols to subscribe")
                 await asyncio.sleep(10)
                 continue
 
             resubscribe = subscription_symbols != previous_symbols
             previous_symbols = subscription_symbols.copy()
-            active_twelvedata_symbols = subscription_symbols.copy()
+            active_symbols = subscription_symbols.copy()
 
             session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60, connect=15)
@@ -460,7 +414,7 @@ async def maintain_twelvedata_connection():
                             data = json.loads(msg.data)
 
                             if data.get("event") == "price":
-                                await receive_twelvedata_price(data)
+                                await receive_price(data)
                             elif data.get("event") == "subscribe-status":
                                 success = data.get("success", [])
                                 fails = data.get("fails", [])
@@ -470,8 +424,15 @@ async def maintain_twelvedata_connection():
                                 if fails:
                                     fail_symbols = [s.get("symbol") for s in fails]
                                     print(f"❌ Failed: {fail_symbols}")
+                                    for fail in fails:
+                                        await log_error(
+                                            "subscription", "warning",
+                                            f"Subscription failed: {fail.get('symbol')} - {fail.get('message')}",
+                                            "maintain_twelvedata_connection",
+                                            symbol=fail.get('symbol')
+                                        )
                             elif data.get("event") == "heartbeat":
-                                print(f"💓 TwelveData: {data.get('status', 'ok')}")
+                                print(f"💓 TwelveData heartbeat")
 
                         except json.JSONDecodeError:
                             pass
@@ -507,121 +468,11 @@ async def maintain_twelvedata_connection():
                 await asyncio.sleep(1)
 
 # ========================================
-# BINANCE WEBSOCKET
-# ========================================
-async def receive_binance_price(data):
-    """Handle Binance price events"""
-    global last_price_time
-
-    if "data" in data:
-        ticker_data = data["data"]
-        stream = data.get("stream", "")
-        binance_symbol = stream.split("@")[0].upper()
-    else:
-        ticker_data = data
-        binance_symbol = data.get("s")
-
-    price = ticker_data.get("c")
-    db_symbol = BINANCE_SYMBOL_MAP.get(binance_symbol)
-
-    if not db_symbol:
-        return
-
-    matched = symbol_map.get(db_symbol)
-    if not matched:
-        return
-
-    if price is None:
-        price = 0
-    else:
-        last_price_time = datetime.now(timezone.utc)
-
-    price_data = {
-        "symbol": db_symbol,
-        "standardized_symbol": matched.get("standardized_symbol", db_symbol.split("/")[0]),
-        "price": float(price) if price else 0,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "asset_name": matched.get("asset_name", db_symbol),
-        "market_type": matched.get("market_type", "crypto"),
-        "status": "pulled",
-        "search_symbol": matched.get("standardized_symbol", db_symbol.split("/")[0]),
-        "exchange": "Binance"
-    }
-
-    asyncio.create_task(insert_single_price(price_data))
-
-async def maintain_binance_connection():
-    """Binance WebSocket for crypto"""
-    global shutdown_requested, active_binance_symbols
-    consecutive_failures = 0
-
-    while not shutdown_requested:
-        session = None
-        try:
-            # Check which Binance symbols we need
-            needed_symbols = []
-            for binance_sym, db_sym in BINANCE_SYMBOL_MAP.items():
-                if db_sym in symbols:
-                    needed_symbols.append(binance_sym)
-
-            if not needed_symbols:
-                print("⏸️  No Binance symbols needed, waiting...")
-                await asyncio.sleep(5)
-                continue
-
-            active_binance_symbols = set(BINANCE_SYMBOL_MAP.values())
-
-            session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60, connect=15)
-            )
-
-            print(f"\n🔌 Connecting to Binance (failures: {consecutive_failures})")
-            print(f"📡 Tracking: {', '.join(needed_symbols)}")
-
-            async with session.ws_connect(BINANCE_WEBSOCKET_URL) as ws:
-                print("✅ Binance connected!")
-                consecutive_failures = 0
-
-                async for msg in ws:
-                    if shutdown_requested:
-                        break
-
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            data = json.loads(msg.data)
-                            await receive_binance_price(data)
-                        except json.JSONDecodeError:
-                            pass
-                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                        print(f"❌ Binance WebSocket {msg.type}")
-                        break
-
-        except asyncio.CancelledError:
-            print("🛑 Binance connection cancelled")
-            break
-        except Exception as e:
-            consecutive_failures += 1
-            print(f"❌ Binance error: {str(e)}")
-            await log_error(
-                "connection", "error", str(e),
-                "maintain_binance_connection",
-                stack_trace=traceback.format_exc()
-            )
-        finally:
-            if session and not session.closed:
-                await session.close()
-
-            if consecutive_failures > 0 and not shutdown_requested:
-                await exponential_backoff(consecutive_failures, base_delay=3, max_delay=30)
-            else:
-                await asyncio.sleep(1)
-
-# ========================================
 # WATCHDOG & HEARTBEAT
 # ========================================
 async def watchdog():
     """Monitor and restart dead tasks"""
-    global fetch_task, twelvedata_task, binance_task, shutdown_requested
+    global fetch_task, twelvedata_task, shutdown_requested
     print("👁️  Watchdog started")
 
     while not shutdown_requested:
@@ -652,18 +503,6 @@ async def watchdog():
                 print("🔄 Restarting TwelveData connection...")
                 twelvedata_task = asyncio.create_task(maintain_twelvedata_connection())
 
-            # Check Binance task
-            if binance_task and binance_task.done():
-                exception = binance_task.exception()
-                if exception:
-                    await log_error(
-                        "connection", "critical",
-                        f"Binance died: {exception}",
-                        "watchdog"
-                    )
-                print("🔄 Restarting Binance connection...")
-                binance_task = asyncio.create_task(maintain_binance_connection())
-
             # Health check
             now = datetime.now(timezone.utc)
             time_since_price = (now - last_price_time).total_seconds()
@@ -675,9 +514,7 @@ async def watchdog():
                     "watchdog"
                 )
             else:
-                td_count = len(active_twelvedata_symbols)
-                bn_count = len(active_binance_symbols & symbols)
-                print(f"💚 OK: TD={td_count}, BN={bn_count}, {int(time_since_price)}s ago")
+                print(f"💚 OK: {len(active_symbols)} symbols, {int(time_since_price)}s ago")
 
         except asyncio.CancelledError:
             print("🛑 Watchdog cancelled")
@@ -694,8 +531,7 @@ async def system_heartbeat():
             print(f"💓 HEARTBEAT @ {datetime.now().strftime('%H:%M:%S')}")
             print(f"{'='*60}")
             print(f"   Unique symbols: {len(symbols)}")
-            print(f"   TwelveData: {len(active_twelvedata_symbols)}")
-            print(f"   Binance: {len(active_binance_symbols & symbols)}")
+            print(f"   Active subscriptions: {len(active_symbols)}")
             print(f"   Last price: {(datetime.now(timezone.utc) - last_price_time).seconds}s ago")
             print(f"{'='*60}\n")
         except asyncio.CancelledError:
@@ -713,10 +549,10 @@ def handle_shutdown(signum, frame):
 
 async def graceful_shutdown():
     """Cleanup all tasks"""
-    global fetch_task, twelvedata_task, binance_task, watchdog_task, heartbeat_task
+    global fetch_task, twelvedata_task, watchdog_task, heartbeat_task
     print("🛑 Graceful shutdown initiated...")
 
-    tasks = [fetch_task, twelvedata_task, binance_task, watchdog_task, heartbeat_task]
+    tasks = [fetch_task, twelvedata_task, watchdog_task, heartbeat_task]
     tasks_to_cancel = [t for t in tasks if t and not t.done()]
 
     for task in tasks_to_cancel:
@@ -732,7 +568,7 @@ async def graceful_shutdown():
 # ========================================
 async def main():
     """Main loop with auto-restart"""
-    global fetch_task, twelvedata_task, binance_task, watchdog_task, heartbeat_task
+    global fetch_task, twelvedata_task, watchdog_task, heartbeat_task
     global shutdown_requested
 
     restart_count = 0
@@ -744,29 +580,26 @@ async def main():
     while restart_count < max_restarts and not shutdown_requested:
         try:
             print("\n" + "="*70)
-            print("🚀 PRODUCTION TRADING BOT v2.0 - AUTO-RESTART ENABLED")
+            print("🚀 PRODUCTION TRADING BOT - TWELVEDATA ONLY")
             print("="*70)
             print("Features:")
-            print("  ✅ Auto symbol fetch from game_assets_view")
-            print("  ✅ Deduplication (10 BTC games = 1 BTC symbol)")
-            print("  ✅ TwelveData: Max 8 unique symbols")
-            print("  ✅ Binance: Unlimited crypto")
+            print("  ✅ Fetches unique symbols from fetch-symbols edge function")
+            print("  ✅ TwelveData WebSocket (8 symbol limit on Basic/Grow)")
+            print("  ✅ Pulls prices every ~2 seconds")
+            print("  ✅ Inserts directly to live_prices table (one row per symbol)")
             print("  ✅ Auto-restart on failure")
             print("  ✅ Heartbeat monitoring")
-            print("  ✅ Immediate price insertion")
-            print("  ✅ USD-focused pricing")
             print("="*70 + "\n")
 
             # Start all tasks
             fetch_task = asyncio.create_task(fetch_symbols_loop())
             twelvedata_task = asyncio.create_task(maintain_twelvedata_connection())
-            binance_task = asyncio.create_task(maintain_binance_connection())
             watchdog_task = asyncio.create_task(watchdog())
             heartbeat_task = asyncio.create_task(system_heartbeat())
 
-            # Wait for any task to complete (shouldn't happen normally)
+            # Wait for any task to complete
             done, pending = await asyncio.wait(
-                [fetch_task, twelvedata_task, binance_task, watchdog_task, heartbeat_task],
+                [fetch_task, twelvedata_task, watchdog_task, heartbeat_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
