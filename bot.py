@@ -46,7 +46,7 @@ BINANCE_CRYPTO_STREAMS = [
     "ltcusdt@ticker",
     "bchusdt@ticker"
 ]
-BINANCE_WEBSOCKET_URL = f"wss://stream.binance.com:9443/stream?streams={'/'.join(BINANCE_CRYPTO_STREAMS)}"
+BINANCE_WEBSOCKET_URL = f"wss://stream.binance.com:443/stream?streams={'/'.join(BINANCE_CRYPTO_STREAMS)}"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
